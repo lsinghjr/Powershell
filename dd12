@@ -1,0 +1,1680 @@
+function Load-AQRPowerCLI {
+	
+	$PowerCLIPS1 = "C:\Program Files (x86)\VMware\Infrastructure\PowerCLI\Scripts\Initialize-PowerCLIEnvironment.ps1"
+	$UseVMWareVI = $true
+	If (Test-Path $PowerCLIPS1) {
+		
+		## PowerCLI v6.5
+		$Error.Clear()
+		Write-Host "Importing Module: vmware.Vimautomation.Core"
+		Import-Module vmware.Vimautomation.Core
+		If ($error) {
+			$UseVMWareVI = $false
+		}
+		
+	} Else {
+		
+		$Error.Clear()
+		Write-Host "Adding VMware PSSnapins"
+		Add-PSSnapin VMware.*
+		If ($error) {
+			$UseVMWareVI = $false
+		}
+		
+	}
+	
+	return $UseVMWareVI
+	
+}
+Function Show-AQRInputUserNameDialog () {
+	
+	Add-Type -AssemblyName System.Windows.Forms
+	Add-Type -AssemblyName System.Drawing
+	
+	$terminate = $false
+	$width = 350
+	$height = 200
+	
+	$objForm = New-Object System.Windows.Forms.Form
+	$objForm.Text = "Enter User's SamAccountName to process:"
+	$objForm.Size = New-Object System.Drawing.Size($width, $height)
+	$objForm.StartPosition = "CenterScreen"
+	
+	$objForm.MinimizeBox = $false
+	$objForm.MaximizeBox = $false
+	$objForm.ControlBox = $false
+	
+	$objForm.KeyPreview = $True
+	$objForm.Add_KeyDown({
+			if ($_.KeyCode -eq "Enter") {
+				$Script:r = $objUserNameBox.Text; $objForm.Close()
+			}
+		})
+	$objForm.Add_KeyDown({
+			if ($_.KeyCode -eq "Escape") {
+				$Script:r = "UserCancel"; $objForm.Close()
+			}
+		})
+	
+	## UserName Label
+	$objUserNameLabel = New-Object System.Windows.Forms.Label
+	$objUserNameLabel.Location = New-Object System.Drawing.Size(20, 20)
+	$objUserNameLabel.Size = New-Object System.Drawing.Size(($width - 25), 20)
+	$objUserNameLabel.Text = "User Name to process (SamAccountName):"
+	$objForm.Controls.Add($objUserNameLabel)
+	
+	## UserName Box
+	
+	$UserBoxFont = New-Object System.Drawing.Font("Arial", 25, [System.Drawing.FontStyle]::Bold)
+	$objUserNameBox = New-Object System.Windows.Forms.RichTextBox
+	$objUserNameBox.Font = $UserBoxFont
+	$objUserNameBox.Location = New-Object System.Drawing.Size(20, 40)
+	$objUserNameBox.Size = New-Object System.Drawing.Size(($width - 60), 50)
+	$objUserNameBox.Height = 60
+	$objForm.Controls.Add($objUserNameBox)
+	
+	
+	$objForm.Topmost = $True
+	
+	$actionClickOK = {
+		Write-Host "User clicked OK."
+		$Script:r = $objUserNameBox.Text
+		$objForm.Close()
+	}
+	
+	$actionClickCancel = {
+		Write-Host "User clicked cancel."
+		$terminate = $true
+		$Script:r = "User_Cancel"
+		
+		$r
+		$objForm.Close()
+	}
+	
+	
+	## OK Button
+	$OKButton = New-Object System.Windows.Forms.Button
+	$OKButton.Location = New-Object System.Drawing.Size((($width/2) - 100), ($height - 75))
+	$OKButton.Size = New-Object System.Drawing.Size(75, 23)
+	$OKButton.Text = "OK"
+	$OKButton.TabIndex = 5
+	$OKButton.Add_Click($actionClickOK)
+	$objForm.Controls.Add($OKButton)
+	
+	
+	## Cancel Button
+	$CancelButton = New-Object System.Windows.Forms.Button
+	$CancelButton.Location = New-Object System.Drawing.Size((($width/2) + 25), ($height - 75))
+	$CancelButton.Size = New-Object System.Drawing.Size(75, 23)
+	$CancelButton.Text = "Cancel"
+	$CancelButton.TabIndex = 6
+	$CancelButton.Add_Click($actionClickCancel)
+	$objForm.Controls.Add($CancelButton)
+	
+	$objForm.Add_Shown({
+			$objForm.Activate()
+		})
+	[void]$objForm.ShowDialog()
+	
+	Return $Script:r
+	
+}
+
+Function Show-AQRInputVerifyDialog () {
+	
+	Param (
+		[string]$UserName,
+		[string]$FirstName,
+		[string]$LastName,
+		[string]$DisplayName,
+		[string]$Email,
+		[string]$Phone,
+		[string]$Department
+	)
+	
+	
+	[array]$DropDownList = "Full Termination", "Custom"
+	$Results = @()
+	
+	Add-Type -AssemblyName System.Windows.Forms
+	Add-Type -AssemblyName System.Drawing
+	
+	$terminate = $false
+	$width = 500
+	$height = 350
+	
+	$ValueFont = New-Object System.Drawing.Font("Arial", 10, [System.Drawing.FontStyle]::Bold)
+	$LabelFont = New-Object System.Drawing.Font("Arial", 10, [System.Drawing.FontStyle]::Regular)
+	
+	$objForm = New-Object System.Windows.Forms.Form
+	$objForm.Text = "Please Verify before Proceeding"
+	$objForm.Size = New-Object System.Drawing.Size($width, $height)
+	$objForm.StartPosition = "CenterScreen"
+	
+	$objForm.MinimizeBox = $false
+	$objForm.MaximizeBox = $false
+	$objForm.ControlBox = $false
+	
+	$objForm.KeyPreview = $True
+	$objForm.Add_KeyDown({
+			if ($_.KeyCode -eq "Enter") {
+				$Script:r = "UserOK"; $objForm.Close()
+			}
+		})
+	$objForm.Add_KeyDown({
+			if ($_.KeyCode -eq "Escape") {
+				$Script:r = "UserCancel"; $objForm.Close()
+			}
+		})
+	
+	$labelwidth = 100
+	$valuewidth = $width - $labelwidth - 20
+	
+	## UserName Label
+	$objUserNameLabel = New-Object System.Windows.Forms.Label
+	$objUserNameLabel.Location = New-Object System.Drawing.Size(20, 20)
+	$objUserNameLabel.Size = New-Object System.Drawing.Size($labelwidth, 20)
+	$objUserNameLabel.Text = "User Name:"
+	$objUserNameLabel.Font = $LabelFont
+	$objForm.Controls.Add($objUserNameLabel)
+	
+	## UserName Value
+	$objUserNameValue = New-Object System.Windows.Forms.Label
+	$objUserNameValue.Location = New-Object System.Drawing.Size(($labelwidth + 20), 20)
+	$objUserNameValue.Size = New-Object System.Drawing.Size($valuewidth, 20)
+	$objUserNameValue.Text = $UserName
+	$objUserNameValue.Font = $ValueFont
+	$objUserNameValue.ForeColor = "Blue"
+	$objForm.Controls.Add($objUserNameValue)
+	
+	## FirstName Label
+	$objFirstNameLabel = New-Object System.Windows.Forms.Label
+	$objFirstNameLabel.Location = New-Object System.Drawing.Size(20, 50)
+	$objFirstNameLabel.Size = New-Object System.Drawing.Size($labelwidth, 20)
+	$objFirstNameLabel.Text = "First Name:"
+	$objFirstNameLabel.Font = $LabelFont
+	$objForm.Controls.Add($objFirstNameLabel)
+	
+	## FirstName Value
+	$objFirstNameValue = New-Object System.Windows.Forms.Label
+	$objFirstNameValue.Location = New-Object System.Drawing.Size(($labelwidth + 20), 50)
+	$objFirstNameValue.Size = New-Object System.Drawing.Size($valuewidth, 20)
+	$objFirstNameValue.Text = $FirstName
+	$objFirstNameValue.Font = $ValueFont
+	$objFirstNameValue.ForeColor = "Blue"
+	$objForm.Controls.Add($objFirstNameValue)
+	
+	## LastName Label
+	$objLastNameLabel = New-Object System.Windows.Forms.Label
+	$objLastNameLabel.Location = New-Object System.Drawing.Size(20, 80)
+	$objLastNameLabel.Size = New-Object System.Drawing.Size($labelwidth, 20)
+	$objLastNameLabel.Text = "Last Name:"
+	$objLastNameLabel.Font = $LabelFont
+	$objForm.Controls.Add($objLastNameLabel)
+	
+	## LastName Value
+	$objLastNameValue = New-Object System.Windows.Forms.Label
+	$objLastNameValue.Location = New-Object System.Drawing.Size(($labelwidth + 20), 80)
+	$objLastNameValue.Size = New-Object System.Drawing.Size($valuewidth, 20)
+	$objLastNameValue.Text = $LastName
+	$objLastNameValue.Font = $ValueFont
+	$objLastNameValue.ForeColor = "Blue"
+	$objForm.Controls.Add($objLastNameValue)
+	
+	## DisplayName Label
+	$objDisplayNameLabel = New-Object System.Windows.Forms.Label
+	$objDisplayNameLabel.Location = New-Object System.Drawing.Size(20, 110)
+	$objDisplayNameLabel.Size = New-Object System.Drawing.Size($labelwidth, 20)
+	$objDisplayNameLabel.Text = "Display Name:"
+	$objDisplayNameLabel.Font = $LabelFont
+	$objForm.Controls.Add($objDisplayNameLabel)
+	
+	## DisplayName Value
+	$objDisplayNameValue = New-Object System.Windows.Forms.Label
+	$objDisplayNameValue.Location = New-Object System.Drawing.Size(($labelwidth + 20), 110)
+	$objDisplayNameValue.Size = New-Object System.Drawing.Size($valuewidth, 20)
+	$objDisplayNameValue.Text = $DisplayName
+	$objDisplayNameValue.Font = $ValueFont
+	$objDisplayNameValue.ForeColor = "Blue"
+	$objForm.Controls.Add($objDisplayNameValue)
+	
+	## Email Label
+	$objEmailLabel = New-Object System.Windows.Forms.Label
+	$objEmailLabel.Location = New-Object System.Drawing.Size(20, 140)
+	$objEmailLabel.Size = New-Object System.Drawing.Size($labelwidth, 20)
+	$objEmailLabel.Text = "Email:"
+	$objEmailLabel.Font = $LabelFont
+	$objForm.Controls.Add($objEmailLabel)
+	
+	## Email Value
+	$objEmailValue = New-Object System.Windows.Forms.Label
+	$objEmailValue.Location = New-Object System.Drawing.Size(($labelwidth + 20), 140)
+	$objEmailValue.Size = New-Object System.Drawing.Size($valuewidth, 20)
+	$objEmailValue.Text = $Email
+	$objEmailValue.Font = $ValueFont
+	$objEmailValue.ForeColor = "Blue"
+	$objForm.Controls.Add($objEmailValue)
+	
+	## Department Label
+	$objDepartmentLabel = New-Object System.Windows.Forms.Label
+	$objDepartmentLabel.Location = New-Object System.Drawing.Size(20, 170)
+	$objDepartmentLabel.Size = New-Object System.Drawing.Size($labelwidth, 20)
+	$objDepartmentLabel.Text = "Department:"
+	$objDepartmentLabel.Font = $LabelFont
+	$objForm.Controls.Add($objDepartmentLabel)
+	
+	## Department Value
+	$objDepartmentValue = New-Object System.Windows.Forms.Label
+	$objDepartmentValue.Location = New-Object System.Drawing.Size(($labelwidth + 20), 170)
+	$objDepartmentValue.Size = New-Object System.Drawing.Size($valuewidth, 20)
+	$objDepartmentValue.Text = $Department
+	$objDepartmentValue.Font = $ValueFont
+	$objDepartmentValue.ForeColor = "Blue"
+	$objForm.Controls.Add($objDepartmentValue)
+	
+	## telephone Label
+	$objPhoneLabel = New-Object System.Windows.Forms.Label
+	$objPhoneLabel.Location = New-Object System.Drawing.Size(20, 200)
+	$objPhoneLabel.Size = New-Object System.Drawing.Size($labelwidth, 20)
+	$objPhoneLabel.Text = "Telephone:"
+	$objPhoneLabel.Font = $LabelFont
+	$objForm.Controls.Add($objPhoneLabel)
+	
+	## telephone Value
+	$objPhoneValue = New-Object System.Windows.Forms.Label
+	$objPhoneValue.Location = New-Object System.Drawing.Size(($labelwidth + 20), 200)
+	$objPhoneValue.Size = New-Object System.Drawing.Size($valuewidth, 20)
+	$objPhoneValue.Text = $Phone
+	$objPhoneValue.Font = $ValueFont
+	$objPhoneValue.ForeColor = "Blue"
+	$objForm.Controls.Add($objPhoneValue)
+	
+	$objForm.Topmost = $True
+	
+	$actionClickOK = {
+		Write-Host "User clicked OK."
+		$Script:r = "User_OK"
+		$objForm.Close()
+	}
+	
+	$actionClickGoBack = {
+		Write-Host "User clicked Go Back."
+		$terminate = $true
+		$Script:r = "User_GoBack"
+		
+		$r
+		$objForm.Close()
+	}
+	
+	
+	## OK Button
+	$OKButton = New-Object System.Windows.Forms.Button
+	$OKButton.Location = New-Object System.Drawing.Size((($width/2) - 100), ($height - 75))
+	$OKButton.Size = New-Object System.Drawing.Size(75, 23)
+	$OKButton.Text = "OK"
+	$OKButton.TabIndex = 5
+	$OKButton.Add_Click($actionClickOK)
+	$objForm.Controls.Add($OKButton)
+	
+	
+	## Go Back Button
+	$GoBackButton = New-Object System.Windows.Forms.Button
+	$GoBackButton.Location = New-Object System.Drawing.Size((($width/2) + 25), ($height - 75))
+	$GoBackButton.Size = New-Object System.Drawing.Size(75, 23)
+	$GoBackButton.Text = "Go Back"
+	$GoBackButton.TabIndex = 6
+	$GoBackButton.Add_Click($actionClickGoBack)
+	$objForm.Controls.Add($GoBackButton)
+	
+	
+	$objForm.Add_Shown({
+			$objForm.Activate()
+		})
+	[void]$objForm.ShowDialog()
+	
+	
+	$Info = New-Object -TypeName PSObject
+	Add-Member -Name 'Verify' -InputObject $Info -MemberType NoteProperty -Value $Script:r
+	
+	$Results += $Info
+	
+	Return $Results
+	
+}
+
+function Show-AQRTemplateDialog {
+	Param (
+		[parameter(Mandatory = $true)]$AvailableTemplates,
+		[parameter(Mandatory = $true)][System.Array]$AvailableClusters,
+		[parameter(Mandatory = $false)][System.String]$SelectedTemplate,
+		[parameter(Mandatory = $false)][System.String]$SelectedCluster
+	)
+	
+	Add-Type -AssemblyName System.Windows.Forms
+	Add-Type -AssemblyName System.Drawing
+	$DefaultFont = New-Object System.Drawing.Font("Arial", 11, [System.Drawing.FontStyle]::Regular)
+	$LabelFont = New-Object System.Drawing.Font("Arial", 11, [System.Drawing.FontStyle]::Bold)
+	
+	$terminate = $false
+	
+	##Determine the appropriate width based on the length of Template Names
+	$TemplateNames = $AvailableTemplates | Select-Object -ExpandProperty Type | Sort-Object
+	$LongestNameLength = ($TemplateNames | Measure-Object -Maximum -Property Length).Maximum
+	$ListBoxWidth = ($LongestNameLength * 7) + 80
+	
+	## Define the Template List Box First
+	$listBoxFont = New-Object System.Drawing.Font("Arial", 12, [System.Drawing.FontStyle]::Regular)
+	$TemplateListBox = New-Object System.Windows.Forms.ListBox
+	$TemplateListBox.Location = New-Object System.Drawing.Point(10, 40)
+	$TemplateListBox.Size = New-Object System.Drawing.Size($ListBoxWidth, 20)
+	$TemplateCount = @($AvailableTemplates).Count
+	$TemplateListBox.Height = ($TemplateCount * 18) + 20
+	
+	## Write-Host "Available Templates = $($TemplateCount)"
+	## Write-Host "Listbox height = $($TemplateListBox.Height)"
+	
+	$TemplateNames | ForEach-Object {
+		[void]$TemplateListBox.Items.Add($_)
+	}
+	# Pre-select the template if already selected prior
+	If ($SelectedTemplate) {
+		$TemplateListBox.SelectedItem = $SelectedTemplate
+	}
+	
+	## Define the Cluster List Box
+	$ClusterListBox = New-Object System.Windows.Forms.ListBox
+	$ClusterListBox.Location = New-Object System.Drawing.Point(10, (80 + $TemplateListBox.Height))
+	$ClusterListBox.Size = New-Object System.Drawing.Size($ListBoxWidth, 20)
+	$ClusterListBox.Height = ($AvailableClusters.Count * 18) + 20
+	
+	$AvailableClusters | ForEach-Object {
+		[void]$ClusterListBox.Items.Add($_)
+	}
+	# Pre-select the Cluster if already selected prior
+	If ($SelectedCluster) {
+		$ClusterListBox.SelectedItem = $SelectedCluster
+	}
+	
+	## Now determine the overall form height
+	$height = $TemplateListBox.Height + $ClusterListBox.Height + 200
+	
+	$objForm = New-Object System.Windows.Forms.Form
+	$objForm.Font = $DefaultFont
+	$objForm.Text = 'Select a Template'
+	$objForm.Size = New-Object System.Drawing.Size(($ListBoxWidth + 40), $height)
+	$objForm.StartPosition = 'CenterScreen'
+	
+	$OKButton = New-Object System.Windows.Forms.Button
+	$OKButton.Location = New-Object System.Drawing.Point((2 * ($ListBoxWidth/8)), ($height - 75))
+	$OKButton.Size = New-Object System.Drawing.Size(75, 23)
+	$OKButton.Text = 'OK'
+	$OKButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+	$objForm.AcceptButton = $OKButton
+	$objForm.Controls.Add($OKButton)
+	
+	$CancelButton = New-Object System.Windows.Forms.Button
+	$CancelButton.Location = New-Object System.Drawing.Point((5 * ($ListBoxWidth/8)), ($height - 75))
+	$CancelButton.Size = New-Object System.Drawing.Size(75, 23)
+	$CancelButton.Text = 'Cancel'
+	$CancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+	$objForm.CancelButton = $CancelButton
+	$CancelButton.Add_Click($actionClickCancel)
+	$objForm.Controls.Add($CancelButton)
+	
+	$Templatelabel = New-Object System.Windows.Forms.Label
+	$Templatelabel.Location = New-Object System.Drawing.Point(10, 20)
+	$Templatelabel.Size = New-Object System.Drawing.Size(280, 20)
+	$Templatelabel.Font = $LabelFont
+	$Templatelabel.Text = 'Please select a template:'
+	$Templatelabel.ForeColor = 'Blue'
+	$objForm.Controls.Add($Templatelabel)
+	
+	$Clusterlabel = New-Object System.Windows.Forms.Label
+	$Clusterlabel.Location = New-Object System.Drawing.Point(10, (20 + $TemplateListBox.Height + 40))
+	$Clusterlabel.Size = New-Object System.Drawing.Size(280, 20)
+	$Clusterlabel.Font = $LabelFont
+	$Clusterlabel.Text = 'Please select a Cluster:'
+	$Clusterlabel.ForeColor = 'Blue'
+	$objForm.Controls.Add($Clusterlabel)
+	
+	$objForm.Controls.Add($TemplateListBox)
+	$objForm.Controls.Add($ClusterListBox)
+	
+	$objForm.Topmost = $true
+	
+	## Choose the default Cluster based on selection
+	$TemplateListBox_SelectedIndexChanged = {
+		
+		$ChosenTemplate = $AvailableTemplates | Where-Object {
+			$_.Type -eq $TemplateListBox.SelectedItem
+		}
+		$Defaultcluster = $ChosenTemplate.DefaultCluster
+		
+		If ($DefaultCluster) {
+			
+			$ClusterListBox.SelectedItem = $DefaultCluster
+			
+		}
+		
+	}
+	$TemplateListBox.add_SelectedIndexChanged($TemplateListBox_SelectedIndexChanged)
+	
+	$result = $objForm.ShowDialog()
+	
+	
+	if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+		
+		$ResultObject = New-Object -TypeName PSObject
+		Add-Member -InputObject $ResultObject -MemberType NoteProperty -Name 'Template' -Value $TemplateListBox.SelectedItem
+		Add-Member -InputObject $ResultObject -MemberType NoteProperty -Name 'Cluster' -Value $ClusterListBox.SelectedItem
+		
+	} else {
+		
+		## Assume the user cancelled.
+		$ResultObject = New-Object -TypeName PSObject
+		Add-Member -InputObject $ResultObject -MemberType NoteProperty -Name 'Template' -Value "CANCEL"
+		
+	}
+	
+	Return $ResultObject
+	
+}
+Function Remove-AQRViewVM () {
+	<#
+	.SYNOPSIS
+	Removes a Computer from View
+	
+	.DESCRIPTION
+	All fields are mandatory.
+
+	.EXAMPLE
+	Remove-AQRViewVM -ServerName $ViewServer -ComputerName VWENUSERT21
+	Connects to VMWareViewserver and enumerates an object collection of VMs with User assignments
+	
+	.PARAMETER ServerName
+	Hostname of the VMWare View broker server
+
+	.PARAMETER ComputerName
+	Name of Computer to remove
+	#>
+	[cmdletBinding()]
+	Param (
+		[Parameter(Mandatory = $true)][string]$ViewServer,
+		[Parameter(Mandatory = $true)][string]$ComputerName
+	)
+	
+	Begin {
+		
+		Write-Verbose "Establishing Remote Session on VMWare View Server: $($ViewServer)"
+		$error.clear()
+		Try {
+			
+			$RemoteSession = New-PSSession -computername $ViewServer
+			
+		} Catch {
+			
+			$r = "ERROR: $($Error[0].Exception.Message)"
+			Throw $r
+			
+		}
+		
+	}
+	
+	Process {
+		
+		If (!$RemoteSession) {
+			
+			Write-Host "Error Connecting to View Server."
+			
+		} else {
+			
+			Write-Verbose "Running remote command on VMWare Server: $($ViewServer)"
+			$ViewVM = Invoke-Command -session $RemoteSession -ArgumentList "$($ComputerName)" -Scriptblock {
+				param (
+					[String]$ComputerName
+				)
+				Add-PSSnapin VMWare.View.Broker
+				Write-Host "($($ENV:Computername))--> $($ComputerName)"
+				$rslt = Get-DesktopVM | Where-Object {
+					($_.Name -eq "$($ComputerName)")
+				}
+				Write-Host "($($ENV:Computername))--> Found: $($rslt.Count)"
+				return $rslt
+				
+			}
+			
+			If (!$ViewVM) {
+				
+				$r = "VM not found"
+				
+			} else {
+				
+				$Error.Clear()
+				If (!$ViewVM.user_sid) {
+					
+					Write-Verbose "No user assigned"
+					
+				} else {
+					
+					## ===================================
+					## Remove Assignment
+					## ===================================
+					$ScriptBlock = {
+						param ([String]$vmid)
+						Add-PSSnapin VMWare.View.Broker
+						$error.clear()
+						Try {
+							
+							Remove-UserOwnership -machine_id "$($vmid)"
+							
+						} Catch {
+							
+							$rslt = "ERROR: $($Error[0].Exception.Message)"
+							
+						} Finally {
+							
+							if (!$error) {
+								$rslt = "SUCCESS"
+							}
+							
+						} # Try
+						
+						$rslt
+						
+					}
+					
+					Write-Verbose "Removing Assignment for VM: $($ComputerName) (ID = $($ViewVM.machine_id))"
+					$error.clear()
+					Try {
+						
+						$rslt = Invoke-Command -session $RemoteSession -ArgumentList "$($ViewVM.machine_id)" -Scriptblock $ScriptBlock
+						
+					} Catch {
+						
+						$r = "ERROR: $($Error[0].Exception.Message)"
+						
+					}
+					
+				}
+				
+				If (!$error) {
+					
+					## =======================================
+					## Remove from VMWare View ADAM Database
+					## =======================================
+					Write-Verbose "Removing VM from VMware View: $($ComputerName)"
+					$error.clear()
+					Try {
+						
+						$rslt = Remove-AQRVMWareViewADAMEntry -ViewServer $ViewServer -ComputerName $ComputerName
+						
+					} Catch {
+						
+						$r = "ERROR: $($Error[0].Exception.Message)"
+						
+					} # Try
+					
+					If (!$error) {
+						
+						$r = "SUCCESS"
+						
+					}
+					
+				}
+				
+			}
+			
+		}
+		
+	} # Process
+	
+	End {
+		
+		If ($RemoteSession) { Remove-PSSession -Id $RemoteSession.Id }
+		Return $r
+		
+	}
+	
+} #Function Remove-AQRViewVM
+
+Function Add-AQRViewVM () {
+	<#
+	.SYNOPSIS
+	Add a Computer into a View Pool
+	
+	.DESCRIPTION
+	All fields are mandatory.
+
+	.EXAMPLE
+	Add-AQRViewVM -ServerName $ViewServer -ComputerName VWENUSERT21 -Pool AQR-Win10
+	Adds computer 'VWENUSERT21' to View Pool 'AQR-Win10'
+	
+	.PARAMETER ServerName
+	Hostname of the VMWare View broker server
+
+	.PARAMETER Pool
+	Name of Pool to add View Entry
+
+	.PARAMETER ComputerName
+	Name of Computer to add. Make sure that this computer is present in the same vCenter as the target View Pool
+	
+	.PARAMETER LocalPSM1Module
+	#>
+	[cmdletBinding()]
+	Param (
+		[Parameter(Mandatory = $true)][string]$ViewServer,
+		[Parameter(Mandatory = $true)][string]$Pool,
+		[Parameter(Mandatory = $true)][string]$ComputerName,
+		[Parameter(Mandatory = $true)][string]$LocalPSM1Module
+	)
+	
+	Begin {
+		
+		Write-Verbose "Establishing Remote Session on VMWare View Server: $($ViewServer)"
+		$error.clear()
+		Try {
+			
+			$RemoteSession = New-PSSession -computername $ViewServer
+			
+		} Catch {
+			
+			$r = "ERROR: $($Error[0].Exception.Message)"
+			Throw $r
+			
+		}
+		
+	}
+	
+	Process {
+		
+		If (!$RemoteSession) {
+			
+			Write-Host "Error Connecting to View Server."
+			
+		} else {
+			
+			Write-Verbose "Running remote command on VMWare Server: $($ViewServer)"
+			$Error.Clear()
+			Try {
+				
+				$r = Invoke-Command -session $RemoteSession -ArgumentList $ComputerName, $Pool, $LocalPSM1Module -Scriptblock {
+					Param (
+						[Parameter(Mandatory = $true)]$VMName,
+						[Parameter(Mandatory = $true)]$pool_id,
+						[Parameter(Mandatory = $true)]$ModulePath
+					)
+					Add-PSSnapin VMWare.View.Broker
+					Import-Module $ModulePath
+					$error.clear()
+					Try {
+						
+						Write-Host "$($ENV:computername) -> Get-DesktopVM: $($VMName)"
+						Write-Host "$($ENV:computername) -> Using Pool: $($pool_id)"
+						$VM7Object = Get-DesktopVM -Name $VMName -EA Stop
+						
+						If ($VM7Object.pool_id -eq $pool_id) {
+							
+							Write-Host "$($ENV:computername) -> $($VMName) is already in the pool: $($pool_id)"
+							$AddPoolResult = "SUCCESS"
+							
+						} Else {
+							
+							Write-Host "$($ENV:computername) -> Add-AQRVMWareViewVMtoPool: vc-id = $($VM7Object.vc_id)"
+							$AddPoolResult = Add-AQRVMWareViewVMtoPool -VMObject $VM7Object -pool_id $pool_id
+							
+						} # If
+						
+					} Catch {
+						
+						## not catching...
+						$err1 = $Error[0]
+						$err2 = $_
+						
+						$rslt = "ERROR: $($Error[0].Exception.Message)"
+						
+					} Finally {
+						
+						if ($AddPoolResult -eq "SUCCESS") {
+							
+							Write-Host "$($ENV:computername) -> Add to Pool Result: $($AddPoolResult)"
+							## Retrieve the Machine ID by re-initializing the VMObject
+							Write-Host "$($ENV:computername) -> Get-DesktopVM: $($VMName)"
+							$VM7Object = Get-DesktopVM -Name $VMName -EA Stop
+							$VMID = $VM7Object.machine_id
+							
+							Write-Host "$($ENV:computername) -> Machine ID: $($VMID)"
+							
+							## We will return the Machine ID. this will be used for User assignment.
+							$rslt = $VMID
+							
+						} else {
+							
+							Write-Host "$($ENV:computername) -> Add to Pool Result: $($AddPoolResult)" -ForegroundColor Red
+							$rslt = $AddPoolResult
+							
+						}
+						
+					} # Try
+					
+					Write-Host "$($ENV:computername) -> Returning Result: $($rslt)"
+					Return $rslt
+					
+				} # ScriptBlock
+				
+			} Catch {
+				
+				$r = "ERROR: $($Error[0].Exception.Message)"
+				
+			}
+			
+			If (!($Error)) {
+				
+				Write-Verbose "New Machine ID: $($r)"
+				
+			}
+			
+		}
+		
+	} # Process
+	
+	End {
+		
+		If ($RemoteSession) { Remove-PSSession -Id $RemoteSession.Id -ErrorAction SilentlyContinue }
+		Return $r
+		
+	}
+	
+} #Function Add-AQRViewVM
+
+
+Function Get-AQRVMWareViewAssignments () {
+<#
+	.SYNOPSIS
+	Returns Object collection of VMWare View assignments
+	
+	.DESCRIPTION
+	All fields are mandatory.
+
+	.EXAMPLE
+	Get-AQRVMWareViewAssignments -ServerName VMwareViewServer
+	Connects to VMWareViewserver and enumerates an object collection of VMs with User assignments
+	
+	.PARAMETER ServerName
+	Hostname of the VMWare View broker server
+	
+#>
+
+    [cmdletBinding()]
+    Param(
+		[Parameter(Mandatory=$true)][string]$ViewServer,
+		[Parameter(Mandatory=$true)][string]$UserName
+    )
+
+    Begin {}
+	
+
+    Process {
+
+	    # Setup Remote Session
+	    $error.clear()
+	    Try
+	    {
+
+		    $RemoteSession = new-PSSession -computername $ViewServer 
+
+	    } Catch {
+
+		    $r = "ERROR: $($Error[0].Exception.Message)"
+
+	    } Finally {
+
+	        if (!$error) {
+
+		        $VMAssignments = Invoke-Command -session $RemoteSession -Scriptblock	{
+
+			        Add-PSSnapin VMWare.View.Broker
+			        Get-DesktopVM | Where-Object { ($_.user_displayname -eq "$($vmuser)") }
+
+		        }
+		        $VMCount = ($VMAssignments | Measure).Count
+		        Write-Host "Number of VM Assignments found: $($VMCount)"
+
+                Remove-PSSession -Id $RemoteSession.Id
+
+                $r = $VMAssignments
+
+            } # If
+
+        } # Try
+
+    } # Process
+
+    End { 
+    
+        Return $r
+
+    }
+
+} #Function Get-AQRVMWareViewAssignments
+
+
+
+Function Connect-AQRVMWareViewADAMDatabase () {
+<#
+	.SYNOPSIS
+	Connects to a VMWare View ADAM Database
+	
+	.DESCRIPTION
+	All fields are mandatory.
+
+	.EXAMPLE
+	Connect-AQRVMWareViewADAMDatabase -ViewServer VMwareViewServer
+	Connects to VMWareViewserver ADAM database
+	
+	.PARAMETER ViewServer
+	Hostname of the VMWare View broker server
+
+#>
+[CmdletBinding()]
+ 
+    #Requires -Modules ActiveDirectory
+   
+    Param(
+        [Parameter(Mandatory=$True,ValueFromPipelineByPropertyName=$True)][string]$ViewServer
+    )
+ 
+    Begin{}
+   
+    Process {
+
+        $ViewServer       = $ViewServer.ToUpper()
+        $ViewServerPSName = ($ViewServer.Split("."))[0]
+        $ViewServerRoot   = "OU=Servers,dc=vdi,dc=vmware,dc=int"
+
+        Write-Verbose -Message "Trying to connect to $ViewServer ADAM database as PSName $ViewServerPSName..."
+ 
+        $Error.Clear()
+        Try {
+
+            $VDMADAMDatabase = New-PSDrive -Name $ViewServerPSName -PSProvider 'ActiveDirectory' -Root $ViewServerRoot -Server "$($ViewServer):389" -Scope 'Global' -ErrorAction Stop
+
+        } Catch {
+        
+            Write-Warning -Message "Could not connect to $ViewServer ADAM database: $($_.Exception.Message)"
+
+        } Finally {
+
+            If (!$Error) {
+
+                Write-Verbose -Message "Successfully connected to $ViewServer ADAM database."
+
+            }
+
+        } # Try
+
+    } # Process
+ 
+    End {
+
+        If ($PassThru -eq $True){ $VDMADAMDatabase }
+
+    }
+
+} # Function Connect-AQRVMWareViewADAMDatabase
+
+
+ 
+Function Disconnect-AQRVMWareViewADAMDatabase () {
+<#
+	.SYNOPSIS
+	Disconnects from VMWare View ADAM Database
+	
+	.DESCRIPTION
+	All fields are mandatory.
+
+	.EXAMPLE
+	Disconnect-AQRVMWareViewADAMDatabase -ViewServer VMwareViewServer
+	Disconnects from VMWareViewserver ADAM database
+	
+	.PARAMETER ViewServer
+	Hostname of the VMWare View broker server
+
+#>
+
+    [CmdletBinding()]
+ 
+    #Requires -Modules ActiveDirectory
+   
+    Param(
+        [Parameter(Mandatory=$True,ValueFromPipelineByPropertyName=$True)][string]$ViewServer
+    )
+ 
+    Begin{}
+   
+    Process{
+
+        $ViewServer = $ViewServer.ToUpper()
+        $ViewServerPSName = ($ViewServer.Split("."))[0]
+
+        Write-Verbose -Message "Disconnecting $ViewServer ADAM database ..."
+
+        $Error.Clear()
+        Try {
+
+            Remove-PSDrive -Name $ViewServerPSName
+
+        } Catch {
+            
+            $r = "A drive with the name '$ViewServer' does not exist."
+            Write-Warning -Message $r
+
+        } Finally {
+
+            If (!$Error) {
+                
+                $r = "$ViewServer ADAM database was successfully disconnected."
+                Write-Verbose -Message $r
+
+            }
+
+        } # Try
+
+    } # Process
+ 
+    End {
+    
+        Return $r
+    
+    }
+
+} #Function Disconnect-AQRVMWareViewADAMDatabase
+
+
+
+Function Remove-AQRVMwareViewADAMEntry () {
+<#
+	.SYNOPSIS
+	Removes an VM from the VMWare View ADAM Database
+	
+	.DESCRIPTION
+	All fields are mandatory.
+
+	.EXAMPLE
+	Remove-AQRVMwareViewADAMEntry -ViewServer VMwareViewServer -ComputerName VM01
+	Connects to VMWareViewserver and Removes targeted VM from the View ADAM database
+	
+	.PARAMETER ViewServer
+	Hostname of the VMWare View broker server
+
+    .PARAMETER ComputerName
+    Hostname of the VM to target
+	
+#>
+    [CmdletBinding()]
+ 
+    #Requires -Modules ActiveDirectory
+   
+    Param(
+        [Parameter(Mandatory=$True,ValueFromPipelineByPropertyName=$True)][string]$ViewServer,
+        [Parameter(Mandatory=$True,ValueFromPipelineByPropertyName=$True)][string]$ComputerName
+    )
+ 
+    Begin{}
+   
+    Process{
+
+        $ViewServer = $ViewServer.ToUpper()
+        $ViewServerPSName = ($ViewServer.Split("."))[0]
+        $ComputerName = $ComputerName.ToUpper()
+        
+
+        ## Ensure there a connection to the VMWAre View ADAM database
+
+        Write-Verbose -Message "Checking if $ViewServerPSName ADAM database is connected ..."
+        $PSDriveTest = Test-Path -Path "$ViewServerPSName`:"
+        If($PSDriveTest) {
+
+            Write-Verbose -Message "$ViewServerPSName ADAM database is connected."
+
+        } Else {
+
+            Write-Verbose -Message "$ViewServerPSName ADAM database is not connected. Attempting to connect ..."
+            Connect-AQRVMWareViewADAMDatabase -ViewServer $ViewServer
+            $PSDriveTest = Test-Path -Path "$ViewServerPSName`:"
+
+        } # If
+ 
+        If ($PSDriveTest) {
+            
+            $CurrentLocation = Get-Location
+            Push-Location
+            Write-Verbose -Message "Accessing $ViewServerPSName ADAM database ..."
+            Set-Location -Path "$ViewServerPSName`:" -ErrorAction Stop
+ 
+            Foreach ($Computer in $ComputerName) {
+
+                $ADAMComputer = Get-ADObject -Filter {pae-DisplayName -like $Computer} -Properties * -ErrorAction Stop  
+               
+                If($ADAMComputer -ne $null){
+
+                    Write-Verbose -Message "Trying to remove $Computer from $ViewServerPSName ADAM database ..."
+
+                    $Error.Clear()
+                    Try {
+
+                        $ADAMComputer | Remove-ADObject -Confirm:$False
+                    
+                    } Catch {
+
+                        $Err1 = $Error[0]
+                        $Err2 = $_
+                        $r = "ERROR: There was a problem removing the Computer Object - $($Err1.Exception.Message)"
+
+                    } Finally {
+                        
+                        If (!$Error) {
+
+                            $r = "$Computer was successfully removed from ADAM database."
+                            Write-Verbose -Message $r
+
+                        } # If
+
+                    } # Try
+
+
+                } ElseIf ($ADAMComputer -eq $null) {
+
+                    $r = "$Computer was not found in ADAM database. Please check spelling and try again."
+                    Write-Warning -Message $r
+
+                } # If
+
+            } # Foreach
+ 
+            Pop-Location
+            Set-Location -Path $CurrentLocation
+            Disconnect-AQRVMWareViewADAMDatabase -ViewServer $ViewServer | Out-Null
+
+        } Else {
+            
+            $r = "Could not access $ViewServerPSName ADAM database."
+            Write-Warning -Message $r
+
+        } # If ($PSDriveTest)
+
+    } # Process
+ 
+    End { Return $r }
+
+} # Function Remove-AQRVMwareViewADAMEntry
+
+
+Function Get-AQRVMWareViewVM {
+<#
+	.SYNOPSIS
+	Returns VM Information object given a computer name
+	
+	.DESCRIPTION
+	All fields are mandatory.
+
+	.EXAMPLE
+	Get-AQRVMWareViewVM -ServerName VMwareViewServer -Computer $Computer
+	Connects to VMWareViewserver and returns a computer object
+	
+	.PARAMETER ServerName
+	Hostname of the VMWare View broker server
+
+	.PARAMETER Computer
+	Name of computer to query
+	
+#>
+	[cmdletBinding()]
+	Param (
+		[Parameter(Mandatory = $true)][string]$ViewServer,
+		[Parameter(Mandatory = $true)][string]$Computer
+	)
+	
+	Begin {
+		
+		Write-Verbose "Establishing Remote Session on VMWare View Server: $($ViewServer)"
+		$error.clear()
+		Try {
+			
+			$RemoteSession = New-PSSession -computername $ViewServer
+			
+		} Catch {
+			
+			$r = "ERROR: $($Error[0].Exception.Message)"
+			Throw $r
+			
+		}
+		
+	}
+	
+	Process {
+		
+		If (!$RemoteSession) {
+			
+			Write-Host "Error Connecting to View Server."
+			
+		} else {
+			
+			$Error.clear()
+			Try {
+				
+				$VM = Invoke-Command -session $RemoteSession -ArgumentList $Computer -Scriptblock {
+					param (
+						[String]$Computer
+					)
+					Add-PSSnapin VMWare.View.Broker
+					Get-DesktopVM -Name $Computer -ErrorAction Stop
+					
+				} -ErrorAction Stop
+				
+			} Catch {
+				
+				$err1 = $error[0]
+				Write-Host $err1.Exception.Message -ForegroundColor Red
+				
+			}
+			
+		} # If
+		
+		
+	} # Process
+	
+	End {
+		
+		If ($RemoteSession) {
+			Remove-PSSession -Id $RemoteSession.Id -ErrorAction SilentlyContinue
+		}
+		Return $VM
+		
+	}
+	
+} # Function
+
+
+Function Grant-AQRVMwareViewVMUserAssignment {
+<#
+	.SYNOPSIS
+	Assigns a manual user assignment to a given View Computer
+	
+	.DESCRIPTION
+	All fields are mandatory.
+
+	.EXAMPLE
+	Grant-AQRVMwareViewVMUserAssignment -ViewServer VMwareViewServer -Computer $Computer -User UserT
+	Connects to VMWareViewserver and assigns user to computer
+	
+	.PARAMETER ServerName
+	Hostname of the VMWare View broker server
+
+	.PARAMETER Computer
+	Name of computer to assign
+
+	.PARAMETER machine_id
+	If you already know the view computer machine_id, it can be defined here in lieu of Computer Name
+	
+	.PARAMETER User
+	Name of User to assign
+	
+	
+#>
+	[cmdletBinding()]
+	Param (
+		[Parameter(Mandatory = $true)][string]$ViewServer,
+		[Parameter(Mandatory = $false)][string]$Computer,
+		[Parameter(Mandatory = $false)][string]$machine_id,
+		[Parameter(Mandatory = $true)][string]$User
+	)
+	
+	Begin {
+		
+		Write-Verbose "Establishing Remote Session on VMWare View Server: $($ViewServer)"
+		$error.clear()
+		Try {
+			
+			$RemoteSession = New-PSSession -computername $ViewServer
+			
+		} Catch {
+			
+			$r = "ERROR: $($Error[0].Exception.Message)"
+			Throw $r
+			
+		}
+		
+	}
+	
+	Process {
+		
+		If (!$RemoteSession) {
+			
+			Write-Host "Error Connecting to View Server."
+			
+		} else {
+			
+			$Error.clear()
+			Try {
+				
+				$rslt = Invoke-Command -session $RemoteSession -ArgumentList $Computer,$User,$machine_id -Scriptblock {
+					param (
+						[String]$Computer,
+						[String]$User,
+						[String]$machine_id
+					)
+					Add-PSSnapin VMWare.View.Broker
+					If (!$machine_id) {
+						
+						Write-Host "($($Env:COMPUTERNAME)) - Getting Desktop VM object"
+						$Error.Clear()
+						Try {
+							
+							$VM = Get-DesktopVM -Name $Computer -ErrorAction Stop
+							
+						} Catch {
+							
+							$err1 = $error[0]
+							Write-Host "($($Env:COMPUTERNAME)) - Could not retrieve VM"
+							Write-Host "($($Env:COMPUTERNAME)) - $($err1.Exception.Message)"
+							
+						}
+						If ($VM) {
+							
+							$machine_id = $VM.machine_id
+							
+						}
+						
+					}
+					If ($machine_id) {
+						
+						Write-Host "$($ENV:computername) -> Get-User: $($User)"
+						$error.clear()
+						Try {
+							
+							$userobj = Get-User -Name $User -ErrorAction Stop | Where-Object {
+								$_.displayName -eq "aqrcapital.com\$($User)"
+							}
+							
+						} Catch {
+							
+							$rslt = "ERROR: $($Error[0].Exception.Message)"
+							
+						} Finally {
+							
+							if (!$error) {
+								
+								Write-Host "$($ENV:computername) -> Update-UserOwnership: MachineID = $($machine_id)"
+								Write-Host "$($ENV:computername) -> Update-UserOwnership: User SID  = $($userobj.sid)"
+								## Assign that user
+								
+								$Error.Clear()
+								Try {
+									
+									Update-UserOwnership -Machine_id "$($machine_id)" -Sid "$($userobj.sid)" -ErrorAction Stop
+									
+								} Catch [System.Exception] {
+									
+									$err1 = $error[0]
+									$err2 = $_
+									$rslt = "ERROR: $($err1.Exception.Message)"
+									
+								} Finally {
+									
+									If (!$Error) {
+										
+										$rslt = "SUCCESS"
+										Write-Host $rslt
+										
+									}
+									
+								} # Try
+								
+							} # if (!$Error)
+							
+						} # Try
+						
+					}
+					
+					Return $rslt
+					
+				} -ErrorAction Stop
+				
+			} Catch {
+				
+				$err1 = $error[0]
+				Write-Host $err1.Exception.Message -ForegroundColor Red
+				
+			}
+			
+		} # If
+		
+	} # Process
+	
+	End {
+		
+		If ($RemoteSession) {
+			Remove-PSSession -Id $RemoteSession.Id -ErrorAction SilentlyContinue
+		}
+		Return $rslt
+		
+	}
+	
+} # Function
+
+
+Function Get-AQRVMWareViewPool { 
+
+<#
+	.SYNOPSIS
+	Returns Pool Information object given a pool name
+	
+	.DESCRIPTION
+	All fields are mandatory.
+
+	.EXAMPLE
+	Get-AQRVMWareViewPoolId -ServerName VMwareViewServer -PoolName $PoolName
+	Connects to VMWareViewserver and returns a pool object
+	
+	.PARAMETER ServerName
+	Hostname of the VMWare View broker server
+
+	.PARAMETER PoolName
+	Name of Pool to query
+	
+#>
+
+    [cmdletBinding()]
+    Param(
+		[Parameter(Mandatory=$true)][string]$ViewServer,
+		[Parameter(Mandatory=$true)][string]$PoolName
+    )
+
+    Begin {}
+	
+
+    Process {
+
+	    # Setup Remote Session
+	    $error.clear()
+	    Try
+	    {
+
+		    $RemoteSession = new-PSSession -computername $ViewServer 
+
+	    } Catch {
+
+		    $r = "ERROR: $($Error[0].Exception.Message)"
+
+	    } Finally {
+
+	        if (!$error) {
+
+		        $Pool = Invoke-Command -session $RemoteSession -Scriptblock	{
+
+			        Add-PSSnapin VMWare.View.Broker
+			        Get-DesktopVM | Where-Object { ($_.user_displayname -eq "$($vmuser)") }
+
+		        }
+
+                Remove-PSSession -Id $RemoteSession.Id
+
+            } # If
+
+        } # Try
+
+    } # Process
+
+    End { 
+    
+        Return $Pool
+
+    }
+
+} # Function
+
+
+
+# SIG # Begin signature block
+Function Get-AQRClusterDatastore () {
+	<#
+	.SYNOPSIS
+		Retrieves a list of available datastores within a given cluster. "*local" Datastores are excluded from results.
+	.INPUTS
+		None
+	.OUTPUTS
+		String value of status message
+	.PARAMETER ClusterName
+		Name of the Cluster to target
+	.PARAMETER ExcludeDatastores
+		String Array of Datastores to exclude
+	.PARAMETER VIConnection
+		VMware Connection object to vSphere
+	.NOTES
+	DEPENDENCIES : 
+    - It's assumed that this script is run with valid VMware PowerCLI modules loaded
+	Revision History
+
+	Date           Personnel        Version      Comments
+	----           ---------        -------      --------
+	09/19/2018     G.Chew           1.0.0        Module Created
+	10/22/2018     G.Chew           1.0.1        Also excluding snapshot datastores
+
+	#>
+	[cmdletbinding()]
+	param
+	(
+		[parameter(Mandatory = $true)][System.String]$ClusterName,
+		[parameter(Mandatory = $false)][System.Array]$ExcludeDatastores,
+		[parameter(Mandatory = $true)]$VIConnection
+	)
+	
+	BEGIN {
+		
+		## Obtaining all Objects
+		Write-Verbose "Obtaining the Target Cluster object: $($ClusterName)"
+		$error.Clear()
+		Try {
+			
+			$TargetClusterObject = Get-Cluster -Name $ClusterName -Server $VIConnection
+			
+		} Catch {
+			
+			Throw "ERROR: Could not grab the Target Cluster Object"
+			
+		}
+		
+	}
+	PROCESS {
+		
+		If (!$TargetClusterObject) {
+			
+			Throw "Target Cluster Object could not be retrieved."
+			
+		} else {
+			
+			$error.Clear()
+			Try {
+				
+				$AvailableDatastores = $TargetClusterObject | Get-Datastore -Server $VIConnection | Where-Object {
+					$_.Accessible -eq $true
+				}
+				
+			} Catch {
+				
+				Throw "ERROR: Could not get available datastores"
+				
+			}
+			## Exclude "*local" and "snap-*"
+			If ($AvailableDatastores) {
+				
+				$AvailableDatastores = $AvailableDatastores | Where-Object { ($_.Name -notlike "*local") -and ($_.Name -notlike "snap-*") }
+				
+			}
+			## Exclude from $ExcludeDatastores if defined
+			If ($ExcludeDatastores) {
+				
+				$AvailableDatastores = $AvailableDatastores | Where-Object { ($_.Name -notin $ExcludeDatastores) }
+				
+			}
+			
+			$AvailableCount = @($AvailableDatastores.Count)
+			Write-Verbose "Available Datastores: $($AvailableCount)"
+			
+			$r = $AvailableDatastores
+			
+		}
+		
+	}
+	END {
+		
+		Return $r
+		
+	}
+	
+}
+
+# ---------------------------------------------------------------------------------------------------
+# SCRIPT NAME  : STD_PSMail.ps1
+# AUTHOR       : 
+# DATE CREATED : 
+# DESCRIPTION  : Common Powershell Mail functions and Variables for re-use
+#
+# NOTES        : 
+#
+# Revision History
+#
+# Date           Personnel        Version      Comments
+# ----           ---------        -------      --------
+# 2/05/2016      G. Chew          1.0          Script created
+# 11/08/2016     G. Chew          1.0.1        Adjusted $body variable to not force to String
+#
+# ---------------------------------------------------------------------------------------------------
+
+Function Send-AQRHTMLEmail () {
+<#
+    .SYNOPSIS
+    Sends HTML Email, logic to check for CC and BCC field
+
+    .PARAMETER ServerName
+    SMTP Server Name   
+
+    .PARAMETER Subject
+    Email Subject
+
+    .PARAMETER To
+    Email addresses to be populated into the TO field
+
+    .PARAMETER From
+    Email is being sent from
+
+    .PARAMETER CC
+    Email addresses to be populated into the CC field
+
+    .PARAMETER attachments
+    Collection of attachments to add (String file names)
+
+    .PARAMETER Body
+    Email Message Body
+
+#>
+   
+    Param(
+        [Parameter(Mandatory=$true)][string]$ServerName,
+        [Parameter(Mandatory=$true)][string]$Subject,
+        [Parameter(Mandatory=$true)][string]$To,
+        [Parameter(Mandatory=$true)][string]$From,
+        [Parameter(Mandatory=$false)][string]$CC,
+        [Parameter(Mandatory=$false)][string]$BCC,
+        [Parameter(Mandatory=$false)]$attachments,
+        [Parameter(Mandatory=$true)]$Body
+    )
+    
+	# Establish connection to SMTP Server
+	$mailobj = New-Object Net.Mail.SMTPclient($ServerName)
+	
+	# Build the Mail object
+	$mailmsg = New-Object Net.Mail.MailMessage($From, $To, $Subject, $Body)
+	$mailmsg.IsBodyHTML = $true
+	If ($CC -ne "")  {$mailmsg.cc.Add($CC)}
+	If ($BCC -ne "") {$mailmsg.bcc.Add($BCC)}
+
+    If ($attachments) {
+
+        foreach ($attach in $attachments) { $mailmsg.Attachments.Add((New-Object Net.Mail.Attachment($attach))) }
+
+    } # If
+	
+	$error.Clear()
+	Try	{
+
+		$mailobj.Send($mailmsg)
+
+	} Catch {
+
+		Write-Error "Error Sending message"
+
+	}
+	$rslt = $error
+	Return $rslt
+
+}
+
+
+
+#Declare Style Header
+$strStyleCSS = '<style type="text/css">'
+#$strStyleCSS = "$($strStyleCSS) <!--`r`n"
+$strStyleCSS = "$($strStyleCSS) p.style1   { font-family: Verdana, Arial, Helvetica, sans-serif; font-size: 16px; font-style: normal; color: #FF0000} `r`n"
+$strStyleCSS = "$($strStyleCSS) p.sidebar1 { font-family: Arial, Helvetica, sans-serif; font-size: 9px}`r`n"
+$strStyleCSS = "$($strStyleCSS) p.text     { font-family: Helvetica, Verdana, sans-serif, Arial; font-size: 12px}`r`n"
+$strStyleCSS = "$($strStyleCSS) p.texttiny { font-family: sans-serif; font-size: 9px}`r`n"
+$strStyleCSS = "$($strStyleCSS) p.textlist { text-indent: 50px; font-family: sans-serif; font-size: 12px}`r`n"
+$strStyleCSS = "$($strStyleCSS) table.report {`r`n"
+$strStyleCSS = "$($strStyleCSS)      table-layout: auto;`r`n"
+$strStyleCSS = "$($strStyleCSS)      border-width: thin;`r`n"
+$strStyleCSS = "$($strStyleCSS)      border-spacing: 2px;`r`n"
+$strStyleCSS = "$($strStyleCSS)      border-style: groove groove groove groove;`r`n"
+$strStyleCSS = "$($strStyleCSS)      border-color: gray;`r`n"
+$strStyleCSS = "$($strStyleCSS)      border-collapse: separate;`r`n"
+$strStyleCSS = "$($strStyleCSS)      background-color: white;`r`n"
+$strStyleCSS = "$($strStyleCSS)      font-family: sans-serif;`r`n"
+$strStyleCSS = "$($strStyleCSS)      font-size: 8pt;`r`n"
+$strStyleCSS = "$($strStyleCSS) }`r`n"
+$strStyleCSS = "$($strStyleCSS) table.report th {`r`n"
+$strStyleCSS = "$($strStyleCSS)      border-width: 1px 1px 1px 1px;`r`n"
+$strStyleCSS = "$($strStyleCSS)      padding: 10px 10px 10px 10px;`r`n"
+$strStyleCSS = "$($strStyleCSS)      border-style: inset inset inset inset;`r`n"
+$strStyleCSS = "$($strStyleCSS)      border-color: gray gray gray gray;`r`n"
+$strStyleCSS = "$($strStyleCSS)      background-color: #00aeef;`r`n"
+$strStyleCSS = "$($strStyleCSS)      font-size: 11pt;`r`n"
+$strStyleCSS = "$($strStyleCSS)      color: white;`r`n"
+$strStyleCSS = "$($strStyleCSS)      -moz-border-radius: 0px 0px 0px 0px;`r`n"
+$strStyleCSS = "$($strStyleCSS) }`r`n"
+$strStyleCSS = "$($strStyleCSS) table.report td {`r`n"
+$strStyleCSS = "$($strStyleCSS)      border-width: thin;`r`n"
+$strStyleCSS = "$($strStyleCSS)      padding: 3px 10px 3px 10px;`r`n"
+$strStyleCSS = "$($strStyleCSS)      border-style: inset inset inset inset;`r`n"
+$strStyleCSS = "$($strStyleCSS)      border-color: gray gray gray gray;`r`n"
+$strStyleCSS = "$($strStyleCSS)      background-color: white;`r`n"
+$strStyleCSS = "$($strStyleCSS)      -moz-border-radius: 0px 0px 0px 0px;`r`n"
+$strStyleCSS = "$($strStyleCSS)      font-size: 8pt;`r`n"
+$strStyleCSS = "$($strStyleCSS) }`r`n"
+$strStyleCSS = "$($strStyleCSS) table.report td.dataOK {`r`n"
+$strStyleCSS = "$($strStyleCSS)      background-color: #00FF00;`r`n"
+$strStyleCSS = "$($strStyleCSS)      color: black;`r`n"
+$strStyleCSS = "$($strStyleCSS)      font-weight: bold;`r`n"
+$strStyleCSS = "$($strStyleCSS) }`r`n"
+$strStyleCSS = "$($strStyleCSS) table.report td.dataWarn {`r`n"
+$strStyleCSS = "$($strStyleCSS)      background-color: #FFFF00;`r`n"
+$strStyleCSS = "$($strStyleCSS)      color: black;`r`n"
+$strStyleCSS = "$($strStyleCSS)      font-weight: bold;`r`n"
+$strStyleCSS = "$($strStyleCSS) }`r`n"
+$strStyleCSS = "$($strStyleCSS) table.report td.dataError {`r`n"
+$strStyleCSS = "$($strStyleCSS)      background-color: #FF0000;`r`n"
+$strStyleCSS = "$($strStyleCSS)      color: white;`r`n"
+$strStyleCSS = "$($strStyleCSS)      font-weight: bold;`r`n"
+$strStyleCSS = "$($strStyleCSS) }`r`n"
+#$strStyleCSS = "$($strStyleCSS) }-->`r`n"
+$strStyleCSS = "$($strStyleCSS) </style>"
+
