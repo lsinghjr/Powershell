@@ -1,0 +1,1687 @@
+<#
+	.SYNOPSIS
+		Creates a Windows 10 VM, based on AD username
+	.DESCRIPTION
+		This script will perform the following actions:
+		1. Creates an AD computer object based on AQR's Desktop naming convention
+		2. Places AD computer object in the appropriate OU
+		3. Determines the best Host and Datastore for the intended VM
+		4. Creates VM from template, based on provided Customization Spec and target VM folder
+		5. Adds custom annotation notes to the VM object
+		6. Adds the VM to View
+		7. Assigns user to the VM within View
+		8. Sends a resultant e-mail
+
+	.INPUTS
+		AD username string
+	.OUTPUTS
+		Email report
+	.PARAMETER SamAccountName
+		AD Username to act against.
+	.PARAMETER Type
+		Template Type to choose. Only valid selections from JSON file.
+	.PARAMETER Cluster
+		Cluster name within vCenter to provision the VM. Only valid selections from JSON file. Default selection is TRM_VDI_2.
+	.EXAMPLE
+	.\New-AQRUserVM.ps1 -UserName UserT
+	Executes the PS1 against username UserT. UI prompt will appear to choose the Template and Cluster.
+	.EXAMPLE
+	.\New-AQRUserVM.ps1 -UserName UserT -Type Core_2018-10
+	Executes the PS1 against username UserT and template type "CORE_2018-10". Default selection is TRM_VDI_2.
+
+	.NOTES
+
+	# ---------------------------------------------------------------------------------------------------
+	 SCRIPT NAME  : New-AQRUserVM.ps1
+	 AUTHOR       : Gregory Chew
+	 DATE CREATED : 05/11/2017
+	 DESCRIPTION  : Creates a new AQR User VM from the VMware Core Template
+
+	 NOTES        : Minimal logging is performed.
+
+	 Revision History
+
+	 Date           Personnel        Version      Comments
+	 ----           ---------        -------      --------
+	 05/11/2017     G. Chew          1.0          Script Created
+	 06/02/2017     G. Chew          1.0.1        INI file read fix
+	 06/26/2017     G. Chew          1.0.2        Fixed $NewComputerName - ToUpper()
+	 09/28/2017     G. Chew          1.1.0        Code to add Computer object to AD group(s)
+	                                              Incorporated the add-pssnapin for VMware
+	 12/05/2017     G. Chew          1.2.0        Ability to Specify a domain Controller in INI, updated
+	                                              all AD cmdlets to use -Server
+	                                              add line breaks in AddADGroups
+	 01/12/2018     G. Chew          1.2.1        Logic for various PowerCLI versions
+	 02/28/2018     G. Chew          1.2.2        Changed CSV delimiter for dept file to ';'
+	                                              because some departments are starting to use commas
+	                                              Fallback to User division if no department found
+	 03/01/2018     G. Chew          1.2.3        Bug fixes, close out PSSession at end
+	                                              Additional check for PSSession at preflight check
+	 04/16/2018     G. Chew          1.2.4        Chooses Datastore and host based on Cluster Name
+	 05/24/2018     G. Chew          1.2.5        Fix for using sAMAccountName instead of CN for the hostname creation
+	 06/11/2018     G. Chew          1.2.6        Set annotations on VM
+	 07/02/2018     G. Chew          1.2.7        added condition to Get-Datastore to only enumerate accessible objects
+	 10/22/2018     G. Chew          1.3.0        Added comment-based help
+                                                  Broke out functions into separate, standalone modules
+                                                  Consolidated department templates to use within a single script, using
+                                                  a JSON file for definitions
+                                                  Better cleanup of session objects
+												  Logging output changed to include username in file name
+												  UI prompt for Cluster and Template selection
+												  Added region blocks
+												  Added the enablement of ScreenDMA
+	 11/15/2018     G. Chew          1.3.1        Ability to define default cluster within JSON
+												  Minor coding tweaks
+	 03/08/2019     G. Chew          1.3.2        Force DiskStorageFormat to Thick on New-VM
+	
+	# ---------------------------------------------------------------------------------------------------
+#>
+#Requires -Version 3
+#Requires -Modules ActiveDirectory
+
+param
+(
+	[parameter(Mandatory = $false)][String]$UserName,
+	[parameter(Mandatory = $false)][ValidateSet('Core_2018-10',
+											 'BusinessDevelopment',
+											 'Compliance',
+											 'ComplianceDev',
+											 'EngineeringDevelopment',
+											 'Finance',
+											 'Legal',
+											 'OPS',
+											 'OPSDevelopment',
+											 'PortfolioImplementation'
+	)][String]$Type,
+	[parameter(Mandatory = $false)][ValidateSet('TRM_VDI_2')][String]$Cluster = 'TRM_VDI_2'
+)
+
+# =====================
+# AQR Variables
+# =====================
+
+$Function = "AQRBuild_CreateUserVM"
+$ScriptVersion = "1.3.2"
+$ScriptDir = (Get-Item $PSCommandPath).DirectoryName
+$ScriptName = (Get-Item $PSCommandPath).Basename
+
+## Current User executing script
+$Admin = $env:Username
+
+## FQDN of current DC
+If ($env:LOGONSERVER) {
+	
+	$DC = ($env:LOGONSERVER).Split('\')[2] + '.' + $env:USERDNSDOMAIN
+	
+} Else {
+	
+	$DC = (([System.DirectoryServices.ActiveDirectory.ActiveDirectorySite]::GetComputerSite()).Servers)[0].Name
+	
+}
+
+# ==========================
+# Include Library functions
+# ==========================
+#region includes
+Write-Host "Including external PS1 files via dot source."
+$librarypath = "$($ScriptDir)\lib"
+
+Write-Host "Library Path: $($librarypath)"
+$ErrorActionPreference = 'Stop'
+Try {
+	
+	Import-Module "$($librarypath)\STD_PSLibrary.psm1" ## GRC Standard Library Functions
+	Import-Module "$($librarypath)\STD_PSAD.ps1"       ## GRC AD Functions
+	Write-Verbose "Loading VMware PS-Snapins"
+	
+	Write-Verbose "Importing AQR VMWare View PS Module"
+	Import-Module "$($librarypath)\AQR-VMWareView.psm1" # AQR VMWare View PS Module
+	
+	Write-Verbose "Loading Library File: $($librarypath)\STD_PSMail.ps1"
+	. "$($librarypath)\STD_PSMail.ps1"                 ## GRC Email Functions
+	Write-Verbose "Loading Library File: $($librarypath)\AQR-NewUserVMDialogs.ps1"
+	. "$($librarypath)\AQR-NewUserVMDialogs.ps1"       ## New UserVM Dialogs
+	. "$($librarypath)\AQR-LoadPowerCLI.ps1"           ## Load PowerCLI
+	Import-Module "$($librarypath)\Set-AQRVMAttribute.psm1" ## Set VM Attribute
+	Import-Module "$($librarypath)\Get-AQRClusterDatastore.psm1" ## Set Cluster Datastores
+	Import-Module "$($librarypath)\Get-AQRClusterHost.psm1" ## Set Cluster ESX Hosts
+	Import-Module "$($librarypath)\Get-AQRVMNetworkVLANUsage.psm1" ## Get VLAN usage counts
+	
+} Catch {
+	
+	Write-Error "One or more library files could not be loaded. Please check and try again."
+	Exit
+	
+} Finally {
+	
+	If (!$Error) {
+		
+		Write-Host "Library files have been loaded successfully."
+		
+	}
+	
+}
+$ErrorActionPreference = 'Continue'
+
+$UseVMWareVI = Load-AQRPowerCLI
+If (!$UseVMWareVI) {
+	Write-Host "Warning: Could not load PowerCLI. Cannot continue."
+	Exit
+}
+#endregion
+
+## ================================================================================================
+## ================================================================================================
+## ================================================================================================
+#region UDF
+
+Function Exit-AQRScript  {
+	param (
+		[parameter(Mandatory = $true)][string]$LogFile,
+		[parameter(Mandatory = $true)]$MailParams,
+		[parameter(Mandatory = $false)]$ResultObject,
+		[parameter(Mandatory = $false)]$VISession,
+		[parameter(Mandatory = $false)]$ViewSession
+	)
+	
+	If ($ResultObject) {
+		
+		## ===========================
+		## Save / Send report
+		## ===========================
+		WriteToLog $logfile "Sending Email"
+		$ResultHTML = $ResultObject | ConvertTo-Html -Body ($strStyleCSS.Replace('.report', '')) -As List
+		
+		$MailParams.Body += $ResultHTML -replace "@CRLF", '<br />'
+		
+		$rslt = Send-AQRHTMLEmail @MailParams
+		
+		if (!$rslt) {
+			
+			WriteToLog $logfile "SUCCESS"
+			
+		} else {
+			
+			WriteToLog $logfile "ERROR sending email: $($rslt[0].Exception.Message)"
+			
+		} # If
+		
+	}
+	If ($VISession) {
+		WriteToLog $logfile "Disconnecting from vSphere"
+		Disconnect-VIServer -Server $VISession -Force -Confirm:$false -ErrorAction SilentlyContinue
+	}
+	
+	If ($ViewSession) {
+		WriteToLog $logfile "Disconnecting PSSession"
+		Remove-PSSession -Session $ViewSession -ErrorAction SilentlyContinue
+	}
+	
+	WriteToLog $logfile "End Execution"
+	WriteToLog $logfile $sep1
+	## Exit-PSSession
+	Exit
+	
+}
+
+#endregion
+## ================================================================================================
+## ================================================================================================
+## ================================================================================================
+#region UsernameCheck
+If ($UserName -eq "") {
+	
+	Write-Verbose "User Name was not specified."
+	While (($UserName -eq "") -or ($UserName -eq "User_GoBack")) {
+		$UserName = Show-AQRInputUserNameDialog
+		
+		If ($UserName -eq "User_Cancel") {
+			
+			Write-Verbose "User Exit."
+			Exit
+			
+		} elseif ($UserName -ne "") {
+			
+			#Gather AD info
+			$Error.Clear()
+			Try {
+				
+				$UserObj = Get-ADUser -Identity $UserName -Server $DC -Properties SamAccountName, displayName, givenName, mail, sn, department, telephoneNumber, comment
+				
+			} Catch {
+				
+				$err1 = $Error[0]
+				
+				Write-Error "There was a problem getting AD info for user: $($UserName)"
+				Write-Error $err1.Exception.Message
+				$UserName = ""
+				
+			} Finally {
+				
+				If ($UserName -ne "") {
+					$VerifyParams = @{
+						UserName = $UserObj.sAMAccountName
+						FirstName = $UserObj.givenName
+						LastName = $UserObj.sn
+						DisplayName = $UserObj.displayName
+						EMail    = $UserObj.mail
+						Phone    = $UserObj.telephoneNumber
+						Department = $UserObj.department
+					}
+					$Verify = Show-AQRInputVerifyDialog @VerifyParams
+					
+					## Reset the input
+					If ($Verify.Verify -eq "User_GoBack") {
+						$UserName = ""
+					}
+					
+				} #If (!$error)
+				
+			} # Try
+			
+		} # If
+		
+	} #While
+	
+} #If
+#endregion
+
+## =======================
+## Open INI file
+## =======================
+#region INIfile
+$inifile = "$($ScriptDir)\$($ScriptName).ini"
+if (!(Test-Path -Path $inifile)) {
+	Write-Host "INI file not found: $($inifile)" -foregroundcolor Red
+	Exit
+}
+
+Write-Host "Reading INI File: $($inifile)"
+$AQRini = Get-IniContent "$($inifile)"
+
+## Verbosity, What-Ifness, Debug output
+$IsDebug = $AQRini["Main"]["DebugMode"]
+$IsVerbose = $AQRini["Main"]["Verbose"]
+$IsWhatIf = $AQRini["Main"]["WhatIf"]
+
+If ($IsDebug -eq 1) {
+	$DebugMode = $True
+} Else {
+	$DebugMode = $False
+}
+If ($IsVerbose -eq 1) {
+	$VerbosePreference = "Continue"
+} Else {
+	$VerbosePreference = "SilentlyContinue"
+}
+If ($IsWhatIf -eq 1) {
+	$WhatIfPreference = $True
+} Else {
+	$WhatIfPreference = $False
+}
+
+$View7LocalPSM1 = $AQRini["Main"]["ViewLibrary"] ## View 7 Local View Library file (should be present on View Broker Server)
+#endregion
+
+## =======================
+## Logging variables
+## =======================
+#region logging
+# Set report output directory
+$outputDir = $AQRini["Main"]["LogDir"]
+
+if (!(Test-Path -Path $outputDir)) {
+	New-Item -ItemType directory -Path $outputDir
+}
+if (!($outputDir.EndsWith("\"))) {
+	$outputDir = "$($outputDir)\"
+}
+
+$Year = Get-Date -uformat "%Y"
+$outputDir = "$($outputDir)$($Year)\"
+if (!(Test-Path -Path $outputDir)) {
+	New-Item -ItemType directory -Path $outputDir
+}
+
+# Set date format for use in file name
+$date = Get-Date -uformat "%Y-%m-%d"
+
+$sep1 = "=" * 75
+$sep2 = "*" * 38
+
+$logfile = $outputDir + "$($date)_$($Function)_$($UserName).log"
+Write-Host "Log file: $logfile" -ForegroundColor Cyan
+#endregion
+
+$DeptListFile = $AQRini["Main"]["DepartmentCodes"]
+If (($DeptListFile.SubString(1, 2) -ne ':\') -And (!($DeptListFile.StartsWith('\\')))) {
+	$DeptListFile = "$($ScriptDir)\$($DeptListFile)"
+}
+
+## =======================
+## Read JSON file
+## =======================
+#region ReadJSON
+$JSONFile = $ScriptDir + '\TemplateMap.json'
+WriteToLog $logfile "JSON File: $($JSONFile)"
+
+If (!(Test-Path $JSONFile)) {
+	
+	WriteToLog $logfile "JSON File does not appear to exist"
+	Exit-AQRScript $logfile
+	
+} Else {
+	
+	WriteToLog $logfile "Reading JSON"
+	$Error.Clear()
+	Try {
+		
+		$JSON = Get-Content -Path $JSONFile -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+		
+	} Catch {
+		
+		$err1 = $error[0]
+		WriteToLog $logfile "Could not read JSON file"
+		WriteToLog $logfile $err1.Exception.Message
+		Exit-AQRScript $logfile
+		
+	}
+	
+	$TemplateCount = ($JSON.Templates).Count
+	WriteToLog $logfile "Number of Templates in JSON: $($TemplateCount)"
+	
+}
+#endregion
+
+#region emailvars
+## Email variables
+$MailFrom = $JSON.Email.From
+$MailTo = ($JSON.Email.To) -join ','
+$MailCC = ($JSON.Email.CC) -join ','
+$MailBCC = ($JSON.Email.BCC) -join ','
+$MailServer = $JSON.Email.Server
+$MailSubject = $JSON.Email.Subject
+
+$MailParams = @{
+	ServerName = $MailServer;
+	Subject    = $MailSubject;
+	To		   = $MailTo;
+	From	   = $MailFrom;
+	CC		   = $MailCC;
+	BCC	       = $MailBCC;
+	#attachments = @($ReportCSV);
+	Body	   = "Executed By: $($Admin) <br />Script Version: $($ScriptVersion) <br /><br />"
+}
+#endregion
+
+## ================================================================================================
+## ================================================================================================
+## ================================================================================================
+## ================================================================================================
+WriteToLog $logfile "Begin Execution"
+
+#region ChooseTemplate
+If ((!($Type)) -or (!($Cluster))) {
+	
+	WriteToLog $logfile "Type or Cluster was not defined. Asking Admin to choose one"
+	$AvailableTemplates = $JSON.Templates | Select-Object Type,DefaultCluster | Sort-Object
+	$AvailableClusters = $JSON.Clusters | Select-Object -ExpandProperty 'id' | Sort-Object
+	
+	while ((!($Type)) -or (!($Cluster))) {
+		
+		$rslt = Show-AQRTemplateDialog -AvailableTemplates $AvailableTemplates -AvailableClusters $AvailableClusters -SelectedTemplate $Type -SelectedCluster $Cluster
+		If ($rslt.Template -eq "CANCEL") { exit }
+		[string]$Type = [string]$rslt.Template
+		[string]$Cluster = [string]$rslt.Cluster
+		
+	}
+	
+}
+WriteToLog $logfile "Chosen Template: $($Type)"
+WriteToLog $logfile "Chosen Cluster:  $($Cluster)"
+#endregion
+
+## =======================
+## Get Template
+## =======================
+#region GetTemplate
+## Find a Template that matches parameters
+WriteToLog $logfile "Finding a template that matches given parameters"
+
+$FoundTemplates = ($JSON.Templates| Sort-Object id | Where-Object {
+		($_.Type -eq $Type)
+	})
+
+$found = @($FoundTemplates).count
+WriteToLog $logfile "Found templates: $($found)"
+
+If (!$FoundTemplates) {
+	
+	WriteToLog $logfile "No matching templates found."
+	Exit-AQRScript $logfile
+	
+}
+$TargetTemplate = $FoundTemplates[0]
+#endregion
+
+#region GetCluster
+## Find a cluster that matches parameters
+WriteToLog $logfile "Finding a cluster that matches given parameters"
+
+$FoundClusters = ($JSON.Clusters | Where-Object {
+		($_.id -eq $Cluster)
+	})
+
+$found = @($FoundClusters).count
+WriteToLog $logfile "Found clusters: $($found)"
+
+If (!$FoundClusters) {
+	
+	WriteToLog $logfile "No matching clusters found."
+	Exit-AQRScript $logfile
+	
+}
+$TargetCluster = $FoundClusters[0]
+#endregion
+
+## ---------------------------------
+## Populate Template Variables
+## ---------------------------------
+$DefaultDept    = $TargetTemplate.DefaultDept
+$TemplateName   = $TargetTemplate.Template
+$TargetVMFolder = $TargetTemplate.TargetVMFolder
+
+## Default Target OU
+#region TargetOU
+$TargetOU = $TargetTemplate.TargetOU
+If (!($TargetOU.EndsWith('/'))) {
+	$TargetOU = "$($TargetOU)/"
+} ## Trailing '/'
+$TargetOUDN = ""
+($TargetOU.Split("/")[0]).Split(".") | ForEach-Object {
+	
+	If ($TargetOUDN -eq "") {
+		$TargetOUDN = "DC=$($_)"
+	} Else {
+		$TargetOUDN = $TargetOUDN + ",DC=$($_)"
+	}
+	
+} # foreach
+for ($i = 1; $i -lt (($TargetOU.Split("/")).Count); $i++) {
+	
+	$OU = $TargetOU.Split("/")[$i].ToString()
+	If ($OU) {
+		$TargetOUDN = "OU=$($OU)" + ",$($TargetOUDN)"
+	}
+	
+} # For
+#endregion
+
+$TargetComputerGroups = ($TargetTemplate.ADGroups) -join ','
+$ViewServer = $TargetTemplate.ViewServer
+$ViewPool   = $TargetTemplate.ViewPool
+$ViewPoolEntitlementGroup = $TargetTemplate.ViewEntitlementGroup
+
+## ---------------------------------
+## Populate Cluster Variables
+## ---------------------------------
+If ($TargetCluster.DC) { $DC = $TargetCluster.DC }
+$vCenter           = $TargetCluster.vCenter              ## VMware VI Server
+$CustSpecName      = $TargetCluster.CustSpec             ## VMware Customization Specification Template to use
+$ExcludeHosts      = $TargetCluster.ExcludeHosts
+$ExcludeDatastores = $TargetCluster.ExcludeDatastores
+
+## TODO
+$Networks          = $TargetCluster.Networks
+
+WriteToLog $logfile "Target OU: $($TargetOU)"
+WriteToLog $logfile "Target OU DN: $($TargetOUDN)"
+WriteToLog $logfile "Target Computer Groups: $($TargetComputerGroups)"
+WriteToLog $logfile "Using Domain Controller: $($DC)"
+WriteToLog $logfile "Executor:               $Admin"
+WriteToLog $logfile "VMWare VI Server:       $($vCenter)"
+WriteToLog $logfile "VMWare Target Cluster:  $($TargetCluster.id)"
+WriteToLog $logfile "VMWare Target Folder:   $($TargetVMFolder)"
+WriteToLog $logfile "VMWare Template:        $($TemplateName)"
+WriteToLog $logfile "VMware Networks:        $($Networks -join '|')"
+WriteToLog $logfile "Exclude Hosts:          $($ExcludeHosts -join '|')"
+WriteToLog $logfile "Exclude Datastores:     $($ExcludeDatastores -join '|')"
+WriteToLog $logfile "VMWare View Server:     $($ViewServer)"
+WriteToLog $logfile "View Target Pool:       $($ViewPool)"
+WriteToLog $logfile "View Entitlement Group: $($ViewPoolEntitlementGroup)"
+
+
+## =======================
+## Prerequisite Steps
+## =======================
+#region ViewPSSession
+## Setup Remote VMware View Session
+WritetoLog $logfile "Checking VMWare View Session connectivity to $($ViewServer)"
+$error.clear()
+Try {
+	
+	$RemoteSession7 = New-PSSession -Computername $ViewServer
+	
+} Catch {
+	
+	$r = "ERROR: $($Error[0].Exception.Message)"
+	WriteToLog $logfile $r 5
+	
+	WriteToLog $logfile "Cannot Proceed further." 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject
+	
+} Finally {
+	
+	If ($RemoteSession7) {
+		
+		WriteToLog $logfile "PS Remote session opened with ID: $($RemoteSession7.Id)"
+		WriteToLog $logfile "Cleanup session"
+		Remove-PSSession -Session $RemoteSession7 -ErrorAction SilentlyContinue
+		
+	} else {
+		
+		## Just in case it did not catch
+		$r = "ERROR: $($Error[0].Exception.Message)"
+		WriteToLog $logfile $r 5
+		WriteToLog $logfile "Cannot Proceed further." 5
+		Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject
+		
+	}
+	
+}
+#endregion
+
+#region ConnectvCenter
+## Ignoring certificate warnings for the session
+WritetoLog $logfile "Ignoring Certificate warnings for this session"
+
+## Connect to VI Server (Ignore certificate warnings)
+WritetoLog $logfile "Opening VMWare VI Server Session to $($vCenter)"
+
+Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Scope Session -Confirm:$false
+
+$error.Clear()
+Try {
+	
+	$VI7Object = Connect-VIServer -Server $vCenter -WarningAction SilentlyContinue -ErrorAction Stop
+	
+} Catch {
+	
+	WritetoLog $logfile "ERROR: Could not connect to VI Server: $($vCenter)" 5
+	WritetoLog $logfile "$($Error[0].Exception.Message)" 5
+	
+	WriteToLog $logfile "Cannot Proceed further." 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject
+	
+}
+#endregion
+
+#region GetClusterObject
+## Obtaining Cluster Object
+WritetoLog $logfile "Obtaining the Target VDI Cluster object: $($TargetCluster.id)"
+$error.Clear()
+Try {
+	
+	$TargetClusterObject = Get-Cluster -Name $TargetCluster.id -Server $VI7Object
+	
+} Catch {
+	
+	WritetoLog $logfile "ERROR: Could not grab the Target Cluster Object" 5
+	WritetoLog $logfile "$($Error[0].Exception.Message)" 5
+	
+	WriteToLog $logfile "Cannot Proceed further." 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+#endregion
+
+## =======================================================================================
+## VMWare Template
+## =======================================================================================
+#region GetVMwareTemplate
+WritetoLog $logfile "Obtaining the VM Template: $($TemplateName)"
+$error.Clear()
+Try {
+	
+	$VMTemplateObject = Get-Template -Name $TemplateName -Server $VI7Object -ErrorAction Stop
+	
+} Catch {
+	
+	WritetoLog $logfile "ERROR: Could not grab the Target Template Object" 5
+	WritetoLog $logfile "$($Error[0].Exception.Message)" 5
+	
+	WriteToLog $logfile "Cannot Proceed further." 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+#endregion
+
+## =======================================================================================
+## Determining best Datastore
+## =======================================================================================
+#region BestDatastore
+$ExcludeCount = @($ExcludeDatastores.Count)
+WritetoLog $logfile "Evaluating the Target Datastore object. Excluding $($ExcludeCount) datastores."
+$error.Clear()
+Try {
+	
+	If ($ExcludeDatastores) {
+		$AvailableDatastores = Get-AQRClusterDatastore -ClusterName $TargetCluster.id -VIConnection $VI7Object -ExcludeDatastores $ExcludeDatastores -ErrorAction Stop
+	} else {
+		$AvailableDatastores = Get-AQRClusterDatastore -ClusterName $TargetCluster.id -VIConnection $VI7Object -ErrorAction Stop
+	}
+	
+	
+} Catch {
+	
+	WritetoLog $logfile "ERROR: Could not get available datastores from cluster" 5
+	WritetoLog $logfile "$($Error[0].Exception.Message)" 5
+	WriteToLog $logfile "Cannot Proceed further." 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+
+$AvailableCount = @($AvailableDatastores.Count)
+WriteToLog $logfile "Available Datastores: $($AvailableCount)"
+
+If ($AvailableCount -eq 0 ) {
+	
+	WritetoLog $logfile "There are no Available Datastores!" 5
+	
+	WriteToLog $logfile "Cannot Proceed further." 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+
+$AvailableDatastores = $AvailableDatastores | Sort-Object -Property FreeSpaceGB -Descending
+
+$error.Clear()
+Try {
+	
+	$TargetDatastoreObject = ($AvailableDatastores | Sort-Object -Property FreeSpaceGB -Descending)[0]
+	
+} Catch {
+	
+	WritetoLog $logfile "ERROR: Could not grab the Target Datastore Object" 5
+	WritetoLog $logfile "$($Error[0].Exception.Message)" 5
+	
+	WriteToLog $logfile "Cannot Proceed further." 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+If (!($TargetDatastoreObject)) {
+	
+	WriteToLog $logfile "Cannot Proceed further." 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+WritetoLog $logfile "Datastore Name:    $($TargetDatastoreObject.Name)" 2
+WritetoLog $logfile "Datastore Path:    $($TargetDatastoreObject.DatastoreBrowserPath)" 2
+WritetoLog $logfile "Datastore GB Free: $($TargetDatastoreObject.FreeSpaceGB)" 2
+
+## Determine if Datastore has enough space.
+$TemplateSizeBytes = $VMTemplateObject.ExtensionData.Storage.PerDatastoreUsage.committed
+[int]$TemplateSizeGB = [int]($TemplateSizeBytes / 1024 / 1024 / 1024)
+WriteToLog $logfile "Template Size in GB: $($TemplateSizeGB)"
+
+$NeededSize = $TemplateSizeGB * 2 ## We will double this as a buffer
+
+WriteToLog $logfile "Largest Available Datastore: $($AvailableDatastores[0].Name), Free Space GB = $($AvailableDatastores[0].FreeSpaceGB)"
+If ($AvailableDatastores[0].FreeSpaceGB -lt $NeededSize) {
+	
+	WriteToLog $logfile "Largest Available Datastore does not have enough free space for this operation."
+	WriteToLog $logfile "Cannot Proceed further. " 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+#endregion
+
+## =======================================================================================
+## Determining best Host
+## =======================================================================================
+#region BestHost
+$ExcludeCount = @($ExcludeHosts.Count)
+WritetoLog $logfile "Evaluating the Target Host object. Excluding $($ExcludeCount) hosts."
+$error.Clear()
+Try {
+	
+	If ($ExcludeHosts) {
+		$AvailableHosts = Get-AQRClusterHost -ClusterName $TargetCluster.id -VIConnection $VI7Object -ExcludeHosts $ExcludeHosts -ErrorAction Stop
+	} else {
+		$AvailableHosts = Get-AQRClusterHost -ClusterName $TargetCluster.id -VIConnection $VI7Object -ErrorAction Stop
+	}
+	
+} Catch {
+	
+	WritetoLog $logfile "ERROR: Could not get available datastores from cluster" 5
+	WritetoLog $logfile "$($Error[0].Exception.Message)" 5
+	WriteToLog $logfile "Cannot Proceed further." 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+
+## TODO Check for CPU requirements based on Template configuration. We should do this based on usage
+[int]$RequiredCPU = [int]$VMTemplateObject.ExtensionData.Summary.Config.NumCpu
+WriteToLog $logfile "Template Required CPU: $($RequiredCPU)"
+
+## Filter out hosts that have enough Memory
+If ($MemoryGB) {
+	$RequiredMemoryGB = $MemoryGB
+} else {
+	[int]$RequiredMemoryGB = [int]($VMTemplateObject.ExtensionData.Summary.Config.MemorySizeMB / 1024)
+}
+WriteToLog $logfile "Template Required Memory (GB): $($RequiredMemoryGB)"
+
+WriteToLog $logfile "Filtering hosts that have enough resources. We will double required memory as a buffer"
+$AvailableHosts = $AvailableHosts | Where-Object {
+	($_.MemoryFreeGB -gt ($RequiredMemoryGB * 2)) | Sort-Object CPUGHzFree -Descending
+}
+If (!$AvailableHosts) {
+	
+	WriteToLog $logfile "Could not find a host with enough available memory."
+	WriteToLog $logfile "Cannot Proceed further. " 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+
+WriteToLog $logfile "ESXi Host object:  $($AvailableHosts[0].Name)"
+WritetoLog $logfile "Memory Usage GB:   $($AvailableHosts[0].MemoryUsedGB)" 2
+WritetoLog $logfile "CPU Usage GHz:     $($AvailableHosts[0].CPUGHzUsed)" 2
+WritetoLog $logfile "CPU Free GHz:      $($AvailableHosts[0].CPUGHzFree)" 2
+
+$error.Clear()
+Try {
+	
+	$TargetVMHostObject = Get-VMHost -Server $VI7Object -Name $AvailableHosts[0].Name -ErrorAction Stop
+	
+} Catch {
+	
+	WritetoLog $logfile "ERROR: Could not grab the Target ESX Host Object" 5
+	WritetoLog $logfile "$($Error[0].Exception.Message)" 5
+	
+	WriteToLog $logfile "Cannot Proceed further." 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+If (!($TargetVMHostObject)) {
+	
+	WriteToLog $logfile "Cannot Proceed further." 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+#endregion
+
+## =======================================================================================
+## Determining best Network to use
+## =======================================================================================
+#region BestNetwork
+$NetworkCount = @($Networks.Count)
+WritetoLog $logfile "Evaluating the best Network VLAN to use. Targeting $($NetworkCount) defined networks."
+$error.Clear()
+Try {
+	
+	$NetworkMetrics = Get-AQRVMNetworkVLANUsage -Networks $Networks -VIConnection $VI7Object -Erroraction Stop
+	
+} Catch {
+	
+	WritetoLog $logfile "ERROR: Could not get Network metrics" 5
+	WritetoLog $logfile "$($Error[0].Exception.Message)" 5
+	WriteToLog $logfile "Cannot Proceed further." 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+$NetworkMetrics = $NetworkMetrics | Sort-Object Count
+$BestNetwork = $NetworkMetrics[0]
+WriteToLog $logfile "Going to use this: $($BestNetwork.Network)" 2
+WriteToLog $logfile "This VLAN has $($BestNetwork.Count) existing Powered on VMs" 2
+
+
+#endregion
+
+## =======================================================================================
+## Customization Spec
+## =======================================================================================
+#region CustSpec
+WritetoLog $logfile "Obtaining the Customization Specification Template: $($CustSpecName)"
+$error.Clear()
+Try {
+	
+	$CustSpecObject = Get-OsCustomizationSpec -Name $CustSpecName -Server $VI7Object
+	
+} Catch {
+	
+	WritetoLog $logfile "ERROR: Could not grab the Customization Specification Object" 5
+	WritetoLog $logfile "$($Error[0].Exception.Message)" 5
+	
+	WriteToLog $logfile "Cannot Proceed further." 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+#endregion
+
+
+#region DeptCSV
+## Read the CSV file
+$Error.Clear()
+Try {
+	
+	$DepartmentCodes = Import-Csv -Path $DeptListFile -Delimiter ';' -ErrorAction Stop
+	
+} Catch {
+	
+	$r = "Could not read the CSV file: $($DeptListFile). Exiting."
+	WriteToLog $logfile $r 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+#endregion
+
+## =======================================================================================
+## Get User Info
+## =======================================================================================
+#region GetUserIno
+$Error.Clear()
+Try {
+	
+	$ADUser = Get-ADUser -Identity $UserName -Server $DC -Properties sn, givenname, department, mail, cn, memberOf, comment -ErrorAction Stop
+	
+	
+} Catch {
+	
+	$r = "AD User ($($UserName)) does not appear to exist. Exiting."
+	WriteToLog $logfile $r 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+
+If (!($ADUser)) {
+	
+	## There was a problem getting AD info
+	Write-Error "AD User was not found: $($UserName)"
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+} Else {
+	
+	$Userfirst = ($aduser.givenname).ToUpper()
+	$Userlast = ($aduser.sn).ToUpper()
+	$UserCN = ($aduser.cn).ToUpper()
+	$UsersAMaccountName = ($aduser.samaccountname).ToUpper()
+	$UserDept = $aduser.department
+	$UserComment = ($aduser.comment)
+	If ($UserComment) { $UserComment = $UserComment.ToUpper() }
+	
+	WriteToLog $logfile $sep2
+	WriteToLog $logfile "User Info:"
+	WriteToLog $logfile "First Name: $($Userfirst)"
+	WriteToLog $logfile "Last Name:  $($Userlast)"
+	WriteToLog $logfile "CN:         $($UserCN)"
+	WriteToLog $logfile "Department: $($UserDept)"
+	WriteToLog $logfile "Comment:    $($UserComment)"
+	WriteToLog $logfile $sep2
+	
+	If (!($UserDept)) {
+		
+		WriteToLog $logfile "Depertment is missing. Defaulting to $($DefaultDept)"
+		$UserDept = $DefaultDept
+		
+	}
+	
+	$MailParams.Subject += " - $($UserCN)"
+	
+} # If (!($ADUser))
+#endregion
+
+## ================================
+$MaxChars = 10
+$UniqueAcctCheckThreshold = 10
+## ================================
+
+#region Initialize Result Object
+$ResultObject = New-Object -TypeName PSObject
+Add-Member -Name 'UserName' -InputObject $ResultObject -MemberType NoteProperty -Value $UsersAMaccountName
+Add-Member -Name 'FirstName' -InputObject $ResultObject -MemberType NoteProperty -Value $Userfirst
+Add-Member -Name 'LastName' -InputObject $ResultObject -MemberType NoteProperty -Value $Userlast
+Add-Member -Name 'DistinguishedName' -InputObject $ResultObject -MemberType NoteProperty -Value $ADUser.distinguishedname
+Add-Member -Name 'Department' -InputObject $ResultObject -MemberType NoteProperty -Value $UserDept
+Add-Member -Name 'UserString' -InputObject $ResultObject -MemberType NoteProperty -Value ""
+Add-Member -Name 'DepartmentCode' -InputObject $ResultObject -MemberType NoteProperty -Value ""
+Add-Member -Name 'ComputerName' -InputObject $ResultObject -MemberType NoteProperty -Value ""
+Add-Member -Name 'VMWareHost' -InputObject $ResultObject -MemberType NoteProperty -Value $TargetVMHostObject.Name
+Add-Member -Name 'VMWareTemplate' -InputObject $ResultObject -MemberType NoteProperty -Value $TemplateName
+Add-Member -Name 'VMWareCustSpec' -InputObject $ResultObject -MemberType NoteProperty -Value $CustSpecName
+Add-Member -Name 'VMWareDatastore' -InputObject $ResultObject -MemberType NoteProperty -Value $TargetDatastoreObject.Name
+Add-Member -Name 'VMwareNetworkVLAN' -InputObject $ResultObject -MemberType NoteProperty -Value $BestNetwork.Network
+Add-Member -Name 'ViewServer' -InputObject $ResultObject -MemberType NoteProperty -Value $ViewServer
+Add-Member -Name 'ViewPool' -InputObject $ResultObject -MemberType NoteProperty -Value $ViewPool
+Add-Member -Name 'ViewPoolEntitlementGroup' -InputObject $ResultObject -MemberType NoteProperty -Value $ViewPoolEntitlementGroup
+
+Add-Member -Name 'CreateADObject' -InputObject $ResultObject -MemberType NoteProperty -Value ""
+Add-Member -Name 'AddADGroups' -InputObject $ResultObject -MemberType NoteProperty -Value ""
+Add-Member -Name 'CreateVM' -InputObject $ResultObject -MemberType NoteProperty -Value ""
+Add-Member -Name 'SetNetworkAdapterVLAN' -InputObject $ResultObject -MemberType NoteProperty -Value ""
+Add-Member -Name 'EnableScreenDMA' -InputObject $ResultObject -MemberType NoteProperty -Value ""
+Add-Member -Name 'PowerOnVM' -InputObject $ResultObject -MemberType NoteProperty -Value ""
+Add-Member -Name 'AddToViewPool' -InputObject $ResultObject -MemberType NoteProperty -Value ""
+Add-Member -Name 'AddtoEntitlementGroup' -InputObject $ResultObject -MemberType NoteProperty -Value ""
+Add-Member -Name 'AssignUser' -InputObject $ResultObject -MemberType NoteProperty -Value ""
+#endregion
+
+#region UsernameComputerString
+## ------------------------------------------------
+## Check to see if Comment Attribute is present
+## ------------------------------------------------
+If ($UserComment) {
+	
+	WriteToLog $logfile "Using AD comment for the User String"
+	$UserSamAcctName = $UserComment.ToUpper()
+	$ResultObject.UserString = $UserComment
+	
+} Else {
+	
+	If ($UsersAMaccountName.length -le $MaxChars) {
+		
+		$UserSamAcctName = $UsersAMaccountName
+		WriteToLog $logfile "We will just use the samaccountname ($($UsersAMaccountName)). Length is $($UsersAMaccountName.length)"
+		
+	} else {
+		
+		## -------------------------------    
+		## Build the User Portion
+		## -------------------------------
+		
+		## The rules:
+		## - Maximum length = 10 chars
+		## - Convention = LastNameF
+		## - If exists, start incrementing digits
+		## - If Last Name is more than 9 characters, truncate accordingly to fit 10 char max rule
+		
+		$FirstInitial = ($UserFirst.SubString(0, 1)).ToUpper()
+		## Removing spaces and dashes if any
+		$Userlast = $Userlast -replace " ", ""
+		$Userlast = $Userlast -replace "-", ""
+		
+		If ($UserLast.Length -lt $MaxChars) {
+			
+			$LastNameString = ($UserLast).ToUpper()
+			
+		} else {
+			
+			$LastNameString = ($UserLast.SubString(0, ($MaxChars - 1))).ToUpper()
+			
+		}
+		
+		$UserSamAcctName = ($LastNameString + $FirstInitial)
+		WriteToLog $logfile "Username: $($UserSamAcctName)"
+		
+		## ------------------------------------
+		## Check on SamAccountName Unique-ness
+		## ------------------------------------
+		WriteToLog $logfile "Check sAMAccountName Existence: $UserSamAcctName"
+		
+		$Root = [adsi] "LDAP://$($DC)/DC=aqrcapital,DC=com"
+		$Searcher = New-Object System.DirectoryServices.DirectorySearcher($root)
+		$Searcher.Filter = "(&(objectClass=user)(sAMAccountName=$($UserSamAcctName)))"
+		$UserCheck = $Searcher.FindOne()
+		
+		$num = 0
+		$i = 1
+		
+		While ($UserCheck) {
+			
+			If ($i -eq $UniqueAcctCheckThreshold) {
+				
+				$r = "Could not generate a unique user name after $($UniqueAcctCheckThreshold) attempts. Exiting."
+				WriteToLog $logfile $r 5
+				Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+				
+			} else {
+				
+				$num = $i
+				$len = $MaxChars - $i.ToString().Length
+				
+				If ($UserLast.Length -le $len) {
+					
+					$LastNameString = ($UserLast).ToUpper()
+					
+				} else {
+					
+					$LastNameString = ($UserLast.SubString(0, $len)).ToUpper()
+					
+				}
+				
+				$UserSamAcctName = "$($LastNameString)$($FirstInitial)$i"
+				
+				WriteToLog $logfile "SamAccountName exists. Checking: $UserSamAcctName"
+				$UserCheck = CheckADUserExists -Attribute "SamAccountName" -Value $UserSamAcctName -DomainController $DC
+				
+			} # If
+			
+			$i++
+			
+		} # While
+		
+		If (!($UserSamAcctName -eq $UserObject.SamAccountName)) {
+			
+			WriteToLog $logfile "Changed to: $UserSamAcctName"
+			
+		}
+		
+		## -----------------------------------------
+		## Check if this string is not already used
+		## -----------------------------------------
+		WriteToLog $logfile "Check pre-Existence of this string"
+		$CommentCheck = Get-ADUser -Filter { Comment -eq $UserSamAcctName } -Server $DC
+		$i = 1
+		While ($CommentCheck) {
+			
+			If ($i -eq $UniqueAcctCheckThreshold) {
+				
+				$r = "Could not generate a unique User String after $($UniqueAcctCheckThreshold) attempts. Exiting."
+				WriteToLog $logfile $r 5
+				$ResultObject.UserString = $r
+				Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+				
+			} else {
+				
+				If (($LastNameString.Length + $i.ToString().Length) -ge ($MaxChars - 1)) {
+					
+					$len = $LastNameString.length - $i.ToString().Length - 1
+					$NewLastNameString = $LastNameString.SubString(0, $len)
+					
+				} Else {
+					
+					$NewLastNameString = $LastNameString
+					
+				}
+				
+				$UserSamAcctName = "$($NewLastNameString)$($FirstInitial)$i"
+				
+				WriteToLog $logfile "User String exists. Checking: $UserSamAcctName"
+				$CommentCheck = Get-ADUser -Filter { Comment -eq $UserSamAcctName } -Server $DC
+				
+			} # If
+			
+			$i++
+			
+		} # While
+		
+		If (!($UserSamAcctName -eq $UserObject.UPN)) {
+			WriteToLog $logfile "Changed to: $UserSamAcctName"
+		}
+		
+	}
+	## -------------------------------    
+	## Set the Comment attribute
+	## -------------------------------
+	WriteToLog $logfile "Setting the Comment field for this User"
+	
+	$ResultObject.UserString = $UserSamAcctName
+	
+	$Error.Clear()
+	Try {
+		
+		$ADUser.Comment = $UserSamAcctName
+		Set-ADUser -Instance $ADUser -Server $DC -ErrorAction Stop
+		
+	} Catch {
+		
+		$r = "WARNING: AD Comment could not be updated!"
+		$ResultObject.UserString = "$($ResultObject.UserString)\n$($r)"
+		WriteToLog $logfile $r 5
+		
+	} Finally {
+		
+		If (!($Error)) { WriteToLog $logfile "SUCCESS" }
+		
+	} ## Try (Set-ADUser)
+	
+}
+
+#endregion
+
+
+## --------------------------
+## User Department Code
+## --------------------------
+#region UserDepartmentCode
+$Dept = $DepartmentCodes | Where-Object { $_.Department -like "$($UserDept)*" }
+
+If (!($Dept)) {
+	
+	$r = "Could not find a matching Department Code. Splitting up the Department name."
+	WriteToLog $logfile $r 4
+	$UserDivision = ($UserDept.split('-')[0]).Trim()
+	WriteToLog $logfile "Trying User Division: '$($UserDivision)'" 4
+	$Dept = $DepartmentCodes | Where-Object { $_.Department -like "$($UserDivision)*"}
+	
+}
+If (!($Dept)) {
+	
+	$r = "Could not find a matching Department Code. Exiting."
+	WriteToLog $logfile $r 5
+	$ResultObject.DepartmentCode = $r
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+$DeptCode = $Dept[0].Code
+WriteToLog $logfile "Department Code: $($DeptCode)"
+$ResultObject.DepartmentCode = $DeptCode
+#endregion
+
+
+## --------------------------
+## Check for unique computer
+## --------------------------
+#region Check for Unique Computer Name
+for ($i = 1; $i -le 9; $i++) {
+	
+	$NewComputerName = ("VW" + $DeptCode + $UserSamAcctName + $i).ToUpper()
+	WriteToLog $logfile "Checking for existence: $($NewComputerName)"
+	
+	$Root = [adsi] "LDAP://$DC/DC=aqrcapital,DC=com"
+	$Searcher = New-Object System.DirectoryServices.DirectorySearcher($root)
+	$Searcher.Filter = "(&(objectClass=computer)(CN=$($NewComputerName)))"
+	
+	$PCCheck = $Searcher.FindOne()
+	If (!($PCCheck)) { break }
+	
+}
+
+If ($PCCheck) {
+	
+	$r = "Could not find an available computer name. Exiting."
+	$ResultObject.ComputerName = $r
+	WriteToLog $logfile $r 5
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+
+WriteToLog $logfile "Using PC Name: $($NewComputerName)"
+$ResultObject.ComputerName = $NewComputerName
+$MailParams.Subject += " - $($NewComputerName)"
+#endregion
+
+
+## --------------------------
+## Create the PC Object
+## --------------------------
+#region Create AD Computer Object
+$Params = @{
+	'Name' = $NewComputerName
+	'managedBy' = $ADUser.DistinguishedName
+	'Server' = $DC
+	'Path' = $TargetOUDN
+}
+
+WriteToLog $logfile "Creating PC Object"
+$Error.Clear()
+Try {
+	
+	$ADPC = New-ADComputer @Params -PassThru -ErrorAction Stop
+	
+} Catch {
+	
+	$err1 = $Error[0]
+	
+	$r = "ERROR: AD Computer Object ($($NewComputerName)) could not be created. Exiting."
+	WritetoLog $logfile $r 5
+	WritetoLog $logfile "$($err1.Exception.InnerException)" 5
+	
+	$ResultObject.CreateADObject = $r
+	
+	Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object
+	
+}
+#endregion
+
+If (!($Error)) {
+		
+	$r = "SUCCESS"
+	WriteToLog $logfile $r
+	$ResultObject.CreateADObject = $r
+	
+	#region AddtoComputerGroups
+	If ($TargetComputerGroups) {
+		
+		## Add computer to AD groups
+		WriteToLog $logfile "Adding Computer object to target computer groups"
+		
+		foreach ($targetgroup in ($TargetTemplate.ADGroups)) {
+			
+			WriteToLog $logfile "Adding to group: $($targetgroup)"
+			$Error.clear()
+			Try {
+				
+				Get-ADGroup -Identity $targetgroup -Server $DC | Add-ADGroupMember -Members $($ADPC.DistinguishedName) -Confirm:$false -Server $DC
+				
+			} Catch {
+				
+				$err1 = $Error[0]
+				
+				$r = "ERROR: Could not add to group: $($targetgroup)"
+				WritetoLog $logfile $r 5
+				WritetoLog $logfile "$($err1.Exception.InnerException)" 5
+				
+			} Finally {
+				
+				If (!($error)) {
+					
+					$r = "SUCCESS"
+					WriteToLog $logfile $r
+					$ResultObject.AddADGroups += "$($targetgroup)@CRLF"
+					
+				}
+				
+			}
+			
+		} # foreach
+	
+	} ## If ($TargetComputerGroups)
+	#endregion
+	
+}
+	
+
+
+## --------------------------
+## Deploy VM from template
+## --------------------------
+$VMParams = @{
+	'Name' = $NewComputerName
+	'VMHost' = $TargetVMHostObject
+	'Location' = $TargetVMFolder
+	'Datastore' = $TargetDatastoreObject
+	'Template' = $VMTemplateObject
+	'Server' = $VI7Object
+	'OSCustomizationSpec' = $CustSpecObject
+	'DiskStorageFormat' = 'Thick'
+}
+
+WritetoLog $logfile "Creating VM from template."
+$Error.Clear()
+Try {
+	
+	$VM7Object = New-VM @VMParams -confirm:$false -EA Stop
+	
+} Catch {
+	
+	$err1 = $Error[0]
+	$err2 = $_
+	
+	$r = "ERROR creating VM Object. - $($err1.Exception.Message)"
+	WriteToLog $logfile $r 5
+	
+	$ResultObject.CreateVM = $r
+	
+} Finally {
+	
+	If (!$Error) {
+		
+		$r = "SUCCESS"
+		WritetoLog $logfile $r
+		$ResultObject.CreateVM = $r
+		
+		## ==========================================================
+		## Set VM Network        $ResultObject.SetNetworkAdapterVLAN
+		## ==========================================================
+		#region SetNetworkAdapterVLAN
+		WriteToLog $logfile "Setting VM Network Adapter to $($BestNetwork.Network)"
+		$ErrorActionPreference = 'Stop'
+		$Error.Clear()
+		Try {
+			
+			$NIC = $VM7Object | Get-NetworkAdapter -Server $VI7Object
+			$NIC = Set-NetworkAdapter -NetworkAdapter $NIC -NetworkName $BEstNetwork.Network -StartConnected $true -Confirm:$false -Server $VI7Object
+			
+		} Catch {
+			
+			$err1 = $Error[0]
+			$err2 = $_
+			
+			$r = "ERROR trying to set network on the VM - $($err1.Exception.Message)"
+			WriteToLog $logfile $r 5
+			$ResultObject.SetNetworkAdapterVLAN = $r
+			
+		} Finally {
+			
+			If (!$error) {
+				
+				$r = "SUCCESS"
+				WriteToLog $logfile $r 4
+				$ResultObject.SetNetworkAdapterVLAN = $r
+				
+			} # If
+			
+		} # Try
+		#endregion
+		
+		## ==========================================================
+		## Enable ScreenDMA             $ResultObject.EnableScreenDMA
+		## ==========================================================
+		#region EnableScreenDMA
+		WriteToLog $logfile "Enabling Screen DMA for Horizon View"
+		$ErrorActionPreference = 'Stop'
+		$Error.Clear()
+		Try {
+			
+			$ScreenDMA = New-AdvancedSetting -Entity $VM7Object -Name 'svga.enableScreenDMA' -Value 'TRUE' -Force -Confirm:$FALSE -Server $VI7Object -ErrorAction Stop
+			
+		} Catch {
+			
+			$err1 = $Error[0]
+			$err2 = $_
+			
+			$r = "ERROR trying to add Advanced Setting - $($err1.Exception.Message)"
+			WriteToLog $logfile $r 5
+			$ResultObject.EnableScreenDMA = $r
+			
+		} Finally {
+			
+			If ($ScreenDMA) {
+				
+				$r = "SUCCESS"
+				WriteToLog $logfile $r 4
+				$ResultObject.EnableScreenDMA = $r
+				
+			} # If
+			
+		} # Try
+		#endregion
+		
+		
+		## =============================================
+		## Power up VM          $ResultObject.PowerOnVM
+		## =============================================
+		#region PowerOnVM
+		WriteToLog $logfile "Powering on VM."
+		$Error.Clear()
+		Try {
+			
+			$VM7Object = Start-VM -VM $VM7Object -Server $VI7Object -Confirm:$False -EA Stop
+			
+		} Catch {
+			
+			$err1 = $Error[0]
+			$err2 = $_
+			
+			$r = "ERROR trying to power on the VM - $($err1.Exception.Message)"
+			WriteToLog $logfile $r 5
+			$ResultObject.PowerOnVM = $r
+			
+		} Finally {
+			
+			If (!$error) {
+				
+				$r = "SUCCESS"
+				WriteToLog $logfile $r 4
+				$ResultObject.PowerOnVM = $r
+				
+			} # If
+			
+		} # Try
+		#endregion
+		
+		## =============================================
+		## Set Custom Attributes
+		## =============================================
+		#region RecordAttributes
+		WriteToLog $logfile "Recording Attributes"
+		Set-AQRVMAttribute -VM $VM7Object -VIConnection $VI7Object -Attribute 'CreationDate' -Value (Get-Date)
+		Set-AQRVMAttribute -VM $VM7Object -VIConnection $VI7Object -Attribute 'Template' -Value $TemplateName
+		#endregion
+		
+	}
+	
+}
+
+
+## -------------------------------
+## Add VM to View and Assign User
+## -------------------------------
+## =====================================================
+## Add VM to manual VM Pool      $VMCheck.AddtoViewPool
+## =====================================================
+$rslt = Add-AQRViewVM -ViewServer $ViewServer -Pool $ViewPool -ComputerName $NewComputerName -LocalPSM1Module $View7LocalPSM1
+
+If ((!$rslt) -or ($rslt.StartsWith('ERROR'))) {
+	
+	WriteToLog $logfile $rslt 5
+	WriteToLog $logfile "User tasks had to be skipped. VM Machine ID could not be identified."
+	$ResultObject.AddtoViewPool = "FAIL"
+	
+} else {
+	
+	$ResultObject.AddtoViewPool = "SUCCESS"
+	$VMMachineID = $rslt
+	WriteToLog $logfile "Result: $($VMMachineID)"
+	
+	## $CN = ($PCOwner.Split(",")[0]).Split("=")[1]
+	
+	## =============================================================================
+	## Add User to View Entitlement group        $ResultObject.AddtoEntitlementGroup
+	## =============================================================================
+	WriteToLog $logfile "Add the user to the View Entitlement Group: $($ViewPoolEntitlementGroup)"
+	$ADGroup = Get-ADGroup -Identity $ViewPoolEntitlementGroup -Server $DC -Properties DistinguishedName
+	$ADGroupDN = $ADGroup.DistinguishedName
+	WriteToLog $logfile "Entitlement Group DN: $($ADGroupDN)"
+	
+	If ($ADUser.MemberOf.Contains($ADGroupDN)) {
+		
+		WriteToLog $logfile "User is already a member of this group."
+		$ResultObject.AddtoEntitlementGroup = "User is already in group"
+		
+	} Else {
+		
+		$Error.Clear()
+		Try {
+			
+			Add-ADGroupMember -Identity $ViewPoolEntitlementGroup -Members $UserName -Server $DC -PassThru -EA Stop
+			
+		} Catch {
+			
+			$err1 = $error[0]
+			$err2 = $_
+			
+			$r = "$($Err1.Exception.Message) - $_"
+			WriteToLog $logfile $r
+			$ResultObject.AddtoEntitlementGroup = "FAIL"
+			
+		} Finally {
+			
+			If (!$error) {
+				
+				WriteToLog $logfile "SUCCESS"
+				$ResultObject.AddtoEntitlementGroup = "SUCCESS"
+				
+			} # If
+			
+		} # Try
+		
+	} # If
+	
+	## ==================================================
+	## Assign VM to user         $ResultObject.AssignUser
+	## ==================================================
+	WriteToLog $logfile "Invoking Command to Remote Session - Assign User to Pool"
+	
+	$r = Grant-AQRVMwareViewVMUserAssignment -ViewServer $ViewServer -User $UserName -machine_id $VMMachineID
+	WriteToLog $logfile "Result: $r"
+	$ResultObject.AssignUser = $r
+	
+} # If
+
+Exit-AQRScript $logfile -MailParams $MailParams -ResultObject $ResultObject -VISession $VI7Object -ViewSession $RemoteSession7
+
+
+# SIG # Begin signature block
+# MIIfyQYJKoZIhvcNAQcCoIIfujCCH7YCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDg7Au3WEwrX+C1
+# E5HjkN/4T0FXPL8WxhAXnfUBB4ktZqCCGowwggQUMIIC/KADAgECAgsEAAAAAAEv
+# TuFS1zANBgkqhkiG9w0BAQUFADBXMQswCQYDVQQGEwJCRTEZMBcGA1UEChMQR2xv
+# YmFsU2lnbiBudi1zYTEQMA4GA1UECxMHUm9vdCBDQTEbMBkGA1UEAxMSR2xvYmFs
+# U2lnbiBSb290IENBMB4XDTExMDQxMzEwMDAwMFoXDTI4MDEyODEyMDAwMFowUjEL
+# MAkGA1UEBhMCQkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExKDAmBgNVBAMT
+# H0dsb2JhbFNpZ24gVGltZXN0YW1waW5nIENBIC0gRzIwggEiMA0GCSqGSIb3DQEB
+# AQUAA4IBDwAwggEKAoIBAQCU72X4tVefoFMNNAbrCR+3Rxhqy/Bb5P8npTTR94ka
+# v56xzRJBbmbUgaCFi2RaRi+ZoI13seK8XN0i12pn0LvoynTei08NsFLlkFvrRw7x
+# 55+cC5BlPheWMEVybTmhFzbKuaCMG08IGfaBMa1hFqRi5rRAnsP8+5X2+7UulYGY
+# 4O/F69gCWXh396rjUmtQkSnF/PfNk2XSYGEi8gb7Mt0WUfoO/Yow8BcJp7vzBK6r
+# kOds33qp9O/EYidfb5ltOHSqEYva38cUTOmFsuzCfUomj+dWuqbgz5JTgHT0A+xo
+# smC8hCAAgxuh7rR0BcEpjmLQR7H68FPMGPkuO/lwfrQlAgMBAAGjgeUwgeIwDgYD
+# VR0PAQH/BAQDAgEGMBIGA1UdEwEB/wQIMAYBAf8CAQAwHQYDVR0OBBYEFEbYPv/c
+# 477/g+b0hZuw3WrWFKnBMEcGA1UdIARAMD4wPAYEVR0gADA0MDIGCCsGAQUFBwIB
+# FiZodHRwczovL3d3dy5nbG9iYWxzaWduLmNvbS9yZXBvc2l0b3J5LzAzBgNVHR8E
+# LDAqMCigJqAkhiJodHRwOi8vY3JsLmdsb2JhbHNpZ24ubmV0L3Jvb3QuY3JsMB8G
+# A1UdIwQYMBaAFGB7ZhpFDZfKiVAvfQTNNKj//P1LMA0GCSqGSIb3DQEBBQUAA4IB
+# AQBOXlaQHka02Ukx87sXOSgbwhbd/UHcCQUEm2+yoprWmS5AmQBVteo/pSB204Y0
+# 1BfMVTrHgu7vqLq82AafFVDfzRZ7UjoC1xka/a/weFzgS8UY3zokHtqsuKlYBAIH
+# MNuwEl7+Mb7wBEj08HD4Ol5Wg889+w289MXtl5251NulJ4TjOJuLpzWGRCCkO22k
+# aguhg/0o69rvKPbMiF37CjsAq+Ah6+IvNWwPjjRFl+ui95kzNX7Lmoq7RU3nP5/C
+# 2Yr6ZbJux35l/+iS4SwxovewJzZIjyZvO+5Ndh95w+V/ljW8LQ7MAbCOf/9RgICn
+# ktSzREZkjIdPFmMHMUtjsN/zMIIEizCCA3OgAwIBAgIQEmmI4z+VDbNHqYO2wNB9
+# ODANBgkqhkiG9w0BAQsFADApMScwJQYDVQQDEx5BUVIgQ2FwaXRhbCBNYW5hZ2Vt
+# ZW50IFJvb3QgQ0EwHhcNMTEwODAzMjIxNDMyWhcNMzkwOTE5MjE1NTI3WjApMScw
+# JQYDVQQDEx5BUVIgQ2FwaXRhbCBNYW5hZ2VtZW50IFJvb3QgQ0EwggEiMA0GCSqG
+# SIb3DQEBAQUAA4IBDwAwggEKAoIBAQC6e72alfsC3L4WJ/ZeoVg3oVoj/WBIFS1o
+# pvapTFaRGSz6Z+Mp5uEvS3moAAnNlTTitnaAOKc7qpZ9AyO2XdVI7ZSL7h+q9S3s
+# F8MNpt5bn2ufB6pBZ3iFSVjDsZ3KshVHbrwturTY31c9EjQfbm0A5sXRr/UZv9mm
+# LpWG0WhAjxkD8dcgqHBxGdEHcyoFEaTbRkEvaxw8zoVKTzkNixnE7hsmVInnYw4K
+# NAjJc3XHVYcrRxtTqHBYiyjuhUdjhwK7u5CPjMv+2ar6MNuyjC0oiRfnLwAOTBf6
+# DKQWesbACH0JOZgYCR674xP5n6qQduUXCSRzRpw/YDXi2sroL3B5AgMBAAGjggGt
+# MIIBqTALBgNVHQ8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQU6/5O
+# epenLdNO6Y8O9DLXlEODmH0wEAYJKwYBBAGCNxUBBAMCAQEwggExBgNVHR8EggEo
+# MIIBJDCCASCgggEcoIIBGIaB0mxkYXA6Ly8vQ049QVFSJTIwQ2FwaXRhbCUyME1h
+# bmFnZW1lbnQlMjBSb290JTIwQ0EsQ049VlQwUENBUk9PVFcwMSxDTj1DRFAsQ049
+# UHVibGljJTIwS2V5JTIwU2VydmljZXMsQ049U2VydmljZXMsQ049Q29uZmlndXJh
+# dGlvbixEQz1hcXJjYXBpdGFsLERDPWNvbT9jcm9zc0NlcnRpZmljYXRlUGFpcj9v
+# bmU/b2JqZWN0Q2xhc3M9Y2VydGlmaWNhdGlvbkF1dGhvcml0eYZBaHR0cDovL3Br
+# aS5hcXIuY29tL2NkcC9BUVIlMjBDYXBpdGFsJTIwTWFuYWdlbWVudCUyMFJvb3Ql
+# MjBDQS5jcmwwIwYJKwYBBAGCNxUCBBYEFBRR/9eFkelw3ECbpY1B+c9I2wHcMA0G
+# CSqGSIb3DQEBCwUAA4IBAQBaHNvqKNWTHgOkS+PzfRErEoK/8PHQsFwMGpTw04MM
+# Lx+EEzYis6Oi8cWHyVmofEQZ0XzSG0SU3bg45fM7qAJGWJN3HmKHgiY3QDcPT6ST
+# WB9XWIocXtt7xItN00kLWkbdk8L7I16zykZFSpDlpagArzhlRjVl5KKms4zYxg5c
+# fQd64Td7OsLGqu0yx0ZbwYuMQZEbZP32SQGia4WUItdkH2YU1NeDhU5OxwxvzYla
+# I1skhm6GQDyQ2fjynLCY4tIegFoxBoz8Mst1kgxYYMo7yKy1hPGlcZpX64YSUVZR
+# JdYOW/kzXh1xheijWVBm8F3Rx/h2YC3E1AKBp9Ti0/TJMIIEnzCCA4egAwIBAgIS
+# ESHWmadklz7x+EJ+6RnMU0EUMA0GCSqGSIb3DQEBBQUAMFIxCzAJBgNVBAYTAkJF
+# MRkwFwYDVQQKExBHbG9iYWxTaWduIG52LXNhMSgwJgYDVQQDEx9HbG9iYWxTaWdu
+# IFRpbWVzdGFtcGluZyBDQSAtIEcyMB4XDTE2MDUyNDAwMDAwMFoXDTI3MDYyNDAw
+# MDAwMFowYDELMAkGA1UEBhMCU0cxHzAdBgNVBAoTFkdNTyBHbG9iYWxTaWduIFB0
+# ZSBMdGQxMDAuBgNVBAMTJ0dsb2JhbFNpZ24gVFNBIGZvciBNUyBBdXRoZW50aWNv
+# ZGUgLSBHMjCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALAXrqLTtgQw
+# Vh5YD7HtVaTWVMvY9nM67F1eqyX9NqX6hMNhQMVGtVlSO0KiLl8TYhCpW+Zz1pIl
+# sX0j4wazhzoOQ/DXAIlTohExUihuXUByPPIJd6dJkpfUbJCgdqf9uNyznfIHYCxP
+# WJgAa9MVVOD63f+ALF8Yppj/1KvsoUVZsi5vYl3g2Rmsi1ecqCYr2RelENJHCBpw
+# LDOLf2iAKrWhXWvdjQICKQOqfDe7uylOPVOTs6b6j9JYkxVMuS2rgKOjJfuv9whk
+# sHpED1wQ119hN6pOa9PSUyWdgnP6LPlysKkZOSpQ+qnQPDrK6Fvv9V9R9PkK2Zc1
+# 3mqF5iMEQq8CAwEAAaOCAV8wggFbMA4GA1UdDwEB/wQEAwIHgDBMBgNVHSAERTBD
+# MEEGCSsGAQQBoDIBHjA0MDIGCCsGAQUFBwIBFiZodHRwczovL3d3dy5nbG9iYWxz
+# aWduLmNvbS9yZXBvc2l0b3J5LzAJBgNVHRMEAjAAMBYGA1UdJQEB/wQMMAoGCCsG
+# AQUFBwMIMEIGA1UdHwQ7MDkwN6A1oDOGMWh0dHA6Ly9jcmwuZ2xvYmFsc2lnbi5j
+# b20vZ3MvZ3N0aW1lc3RhbXBpbmdnMi5jcmwwVAYIKwYBBQUHAQEESDBGMEQGCCsG
+# AQUFBzAChjhodHRwOi8vc2VjdXJlLmdsb2JhbHNpZ24uY29tL2NhY2VydC9nc3Rp
+# bWVzdGFtcGluZ2cyLmNydDAdBgNVHQ4EFgQU1KKESjhaGH+6TzBQvZ3VeofWCfcw
+# HwYDVR0jBBgwFoAURtg+/9zjvv+D5vSFm7DdatYUqcEwDQYJKoZIhvcNAQEFBQAD
+# ggEBAI+pGpFtBKY3IA6Dlt4j02tuH27dZD1oISK1+Ec2aY7hpUXHJKIitykJzFRa
+# rsa8zWOOsz1QSOW0zK7Nko2eKIsTShGqvaPv07I2/LShcr9tl2N5jES8cC9+87zd
+# glOrGvbr+hyXvLY3nKQcMLyrvC1HNt+SIAPoccZY9nUFmjTwC1lagkQ0qoDkL4T2
+# R12WybbKyp23prrkUNPUN7i6IA7Q05IqW8RZu6Ft2zzORJ3BOCqt4429zQl3GhC+
+# ZwoCNmSIubMbJu7nnmDERqi8YTNsz065nLlq8J83/rU9T5rTTf/eII5Ol6b9nwm8
+# TcoYdsmwTYVQ8oDSHQb1WAQHsRgwggY1MIIFHaADAgECAhNvAAAAEdkgpGCCgab0
+# AAEAAAARMA0GCSqGSIb3DQEBCwUAMCkxJzAlBgNVBAMTHkFRUiBDYXBpdGFsIE1h
+# bmFnZW1lbnQgUm9vdCBDQTAeFw0xODA5MjIxMzAyNDlaFw0yODA5MjIxMzEyNDla
+# MF0xEzARBgoJkiaJk/IsZAEZFgNjb20xGjAYBgoJkiaJk/IsZAEZFgphcXJjYXBp
+# dGFsMSowKAYDVQQDEyFBUVIgQ2FwaXRhbCBNYW5hZ2VtZW50IElzc3VpbmcgQ0Ew
+# ggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCaAeb5E5RhbZ1DjBkutAZn
+# k2bLs1y+GxFWiVri9ONwVIW9Ee8KSSSKwTO5d0WdWYbunAMWjLt+wOjeXAURLB9R
+# wWJZP3dzZVGVCLKi2arhe/Om9x/eiQ055TM+UbVPst6bLc2IxgbANMVRQltcI0O3
+# P53bz6e5Sz/GVNwG4TKWEJegHtZd5idl5QCO6Uf7euU/Dw9Mj8/VLh+itDPaXa0L
+# NePQUMNQF8U9CMWUWw3fVUJ0UeAkKnnd0CQroBlT3lioqmDrDKIYMIYFHyweLnZV
+# DMZKHZc7SXDg43z4KFe7yTNHo/NN8J/vDK3OiVkOgFpTBAxXQXquPEmip8mrFc2Z
+# AgMBAAGjggMgMIIDHDAQBgkrBgEEAYI3FQEEAwIBATAjBgkrBgEEAYI3FQIEFgQU
+# X3ITpU7I5o1cC6Xr19Tjw4uWozcwHQYDVR0OBBYEFLDBjcN0t+oYwyB+X2PpU0VC
+# FeNQMBkGCSsGAQQBgjcUAgQMHgoAUwB1AGIAQwBBMAsGA1UdDwQEAwIBhjAPBgNV
+# HRMBAf8EBTADAQH/MB8GA1UdIwQYMBaAFOv+TnqXpy3TTumPDvQy15RDg5h9MIIB
+# NQYDVR0fBIIBLDCCASgwggEkoIIBIKCCARyGgdZsZGFwOi8vL0NOPUFRUiUyMENh
+# cGl0YWwlMjBNYW5hZ2VtZW50JTIwUm9vdCUyMENBLENOPVZUMFBDQVJPT1RXMDEs
+# Q049Q0RQLENOPVB1YmxpYyUyMEtleSUyMFNlcnZpY2VzLENOPVNlcnZpY2VzLENO
+# PUNvbmZpZ3VyYXRpb24sREM9YXFyY2FwaXRhbCxEQz1jb20/Y2VydGlmaWNhdGVS
+# ZXZvY2F0aW9uTGlzdD9iYXNlP29iamVjdENsYXNzPWNSTERpc3RyaWJ1dGlvblBv
+# aW50hkFodHRwOi8vcGtpLmFxci5jb20vY2RwL0FRUiUyMENhcGl0YWwlMjBNYW5h
+# Z2VtZW50JTIwUm9vdCUyMENBLmNybDCCAS8GCCsGAQUFBwEBBIIBITCCAR0wgcgG
+# CCsGAQUFBzAChoG7bGRhcDovLy9DTj1BUVIlMjBDYXBpdGFsJTIwTWFuYWdlbWVu
+# dCUyMFJvb3QlMjBDQSxDTj1BSUEsQ049UHVibGljJTIwS2V5JTIwU2VydmljZXMs
+# Q049U2VydmljZXMsQ049Q29uZmlndXJhdGlvbixEQz1hcXJjYXBpdGFsLERDPWNv
+# bT9jQUNlcnRpZmljYXRlP2Jhc2U/b2JqZWN0Q2xhc3M9Y2VydGlmaWNhdGlvbkF1
+# dGhvcml0eTBQBggrBgEFBQcwAoZEaHR0cDovL3BraS5hcXIuY29tL2FpYS9BUVIl
+# MjBDYXBpdGFsJTIwTWFuYWdlbWVudCUyMFJvb3QlMjBDQSgxKS5jcnQwDQYJKoZI
+# hvcNAQELBQADggEBAEpy3k6s/wK2v78XFdn+7X629Ee9uHVswn+lkCLwRN2fT9yH
+# 154ggNpU+7F/SUmi+kMgW5Q9qlVYS03m1Ed7i8wSXaJPZG0W776alecCU/NzeO09
+# hGqtJWiFe9Ahp9dWdPxyNxBO8+20B1UzErzsqiaZnUhL023uovyYIkiBVfsSrmU2
+# wazILcI1jl06GCAJ3tues7G8XiYrsv/TrBH38CtBPW7bxz3jowoFa3KNLbZubsBK
+# 686K0uASP0Cn7OpoKryCRe/JcUqLAh0J5Uuk83uHlIVR9F9l2E5pDSGqZxdM/WRe
+# RIDssaU+OfNv95C24Aeuxg0c96BK7MIl9dHQ3C8wggcFMIIF7aADAgECAhM2AACe
+# lXNxRaSpzdTcAAEAAJ6VMA0GCSqGSIb3DQEBCwUAMF0xEzARBgoJkiaJk/IsZAEZ
+# FgNjb20xGjAYBgoJkiaJk/IsZAEZFgphcXJjYXBpdGFsMSowKAYDVQQDEyFBUVIg
+# Q2FwaXRhbCBNYW5hZ2VtZW50IElzc3VpbmcgQ0EwHhcNMTgxMTA2MjM0MzAwWhcN
+# MjAxMTA1MjM0MzAwWjCBujELMAkGA1UEBhMCVVMxFDASBgNVBAgTC0Nvbm5lY3Rp
+# Y3V0MRIwEAYDVQQHEwlHcmVlbndpY2gxIzAhBgNVBAoTGkFRUiBDYXBpdGFsIE1h
+# bmFnZW1lbnQgTExDMRQwEgYDVQQLEwtFbmdpbmVlcmluZzElMCMGA1UEAxMcU3lz
+# QWRtaW4gU2lnbmluZyBDZXJ0aWZpY2F0ZTEfMB0GCSqGSIb3DQEJARYQc3lzYWRt
+# aW5AYXFyLmNvbTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKQAh42x
+# RYnv8uvj/16981PHSf8OMsDMYqb4NgL+Euo3vGiCY2SFAFWd6lLNfmYBaIgDYYoW
+# mjwy2j6/HBeS/w9Zamb5Cj1tTNGpxPAUUYOeugTKhp6Qnd1XN0XFb7arYm5cHlfb
+# 7qvpM2+5Uw+fICYxT1oURHO+f6U1LJ2jHxDJP/fu7w0opsfM0PL1KnUYY0UnxCdF
+# cfZJ2f8K5Iv5LwZiZ3V6Js/+8wIRU2vuaNXjEAr5oXZrOa+FMETZSEPFO167olO4
+# KpTfbndC3HlkupT1hOM+pqhLGWCGXpyE8xFS0yi16IDijpnzkN6dtUrlUdSegQJ7
+# yDHc7E11usfrSl0CAwEAAaOCA14wggNaMD0GCSsGAQQBgjcVBwQwMC4GJisGAQQB
+# gjcVCIWn716By+1phMGbKITX70uFybkFgXWDor8xuPI9AgFkAgEUMBMGA1UdJQQM
+# MAoGCCsGAQUFBwMDMAsGA1UdDwQEAwIHgDAbBgkrBgEEAYI3FQoEDjAMMAoGCCsG
+# AQUFBwMDMB0GA1UdDgQWBBQFYdA4+AjvZrQ6cMxX/GEWaDIOBTAfBgNVHSMEGDAW
+# gBSwwY3DdLfqGMMgfl9j6VNFQhXjUDCCAToGA1UdHwSCATEwggEtMIIBKaCCASWg
+# ggEhhoHYbGRhcDovLy9DTj1BUVIlMjBDYXBpdGFsJTIwTWFuYWdlbWVudCUyMElz
+# c3VpbmclMjBDQSxDTj1WVDBQQ0FJU1NXMDEsQ049Q0RQLENOPVB1YmxpYyUyMEtl
+# eSUyMFNlcnZpY2VzLENOPVNlcnZpY2VzLENOPUNvbmZpZ3VyYXRpb24sREM9YXFy
+# Y2FwaXRhbCxEQz1jb20/Y2VydGlmaWNhdGVSZXZvY2F0aW9uTGlzdD9iYXNlP29i
+# amVjdENsYXNzPWNSTERpc3RyaWJ1dGlvblBvaW50hkRodHRwOi8vcGtpLmFxci5j
+# b20vY2RwL0FRUiUyMENhcGl0YWwlMjBNYW5hZ2VtZW50JTIwSXNzdWluZyUyMENB
+# LmNybDCCAVoGCCsGAQUFBwEBBIIBTDCCAUgwgcsGCCsGAQUFBzAChoG+bGRhcDov
+# Ly9DTj1BUVIlMjBDYXBpdGFsJTIwTWFuYWdlbWVudCUyMElzc3VpbmclMjBDQSxD
+# Tj1BSUEsQ049UHVibGljJTIwS2V5JTIwU2VydmljZXMsQ049U2VydmljZXMsQ049
+# Q29uZmlndXJhdGlvbixEQz1hcXJjYXBpdGFsLERDPWNvbT9jQUNlcnRpZmljYXRl
+# P2Jhc2U/b2JqZWN0Q2xhc3M9Y2VydGlmaWNhdGlvbkF1dGhvcml0eTBTBggrBgEF
+# BQcwAoZHaHR0cDovL3BraS5hcXIuY29tL2FpYS9BUVIlMjBDYXBpdGFsJTIwTWFu
+# YWdlbWVudCUyMElzc3VpbmclMjBDQSgxKS5jcnQwIwYIKwYBBQUHMAGGF2h0dHA6
+# Ly9wa2kuYXFyLmNvbS9vY3NwMA0GCSqGSIb3DQEBCwUAA4IBAQAbKFFDBea4V8kJ
+# 4GP0xu84xbgpXUspEZPaDtPqZTeMM/Qwnd5wEF4KVop34RWhcJH81ymR/CrTxHrk
+# qen9Or2WgYhs6hEMxlQiNC/aZMEj9X11bKhDAigaBpP0vVWOGUBa1qfDbJWp4AEq
+# +qCojwItQa30T2MKdzrUMVolGWXMzJ3F+8HrXcFcxUs4T591ndEE/SPHGdGPNxDo
+# t2l24WKvs6UY3RWqh0p5UTQrubYcwEp7rvOdgAAjY7wSSS4pB8Zi3gpmgteZpzAc
+# rZiJ6vE5FxOnGj7i2ZbsL+hBQgF/PkX1F47rw+mroGUzlTJnXnR0IFculIg2vxbA
+# kPSg1LGDMYIEkzCCBI8CAQEwdDBdMRMwEQYKCZImiZPyLGQBGRYDY29tMRowGAYK
+# CZImiZPyLGQBGRYKYXFyY2FwaXRhbDEqMCgGA1UEAxMhQVFSIENhcGl0YWwgTWFu
+# YWdlbWVudCBJc3N1aW5nIENBAhM2AACelXNxRaSpzdTcAAEAAJ6VMA0GCWCGSAFl
+# AwQCAQUAoEwwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwLwYJKoZIhvcNAQkE
+# MSIEIEfbNgs3OvskV0DPQTvTcjYodV3IOHKdKNXOStPTOELeMA0GCSqGSIb3DQEB
+# AQUABIIBAGRzvE5HRYZCsgjVEVzl7mtik9jXP64BPlx1ubSOBlc8B6jCtld1JZ/p
+# 8hw+SMEhwmgDS2hvHEcMRLDS/YRGw99TcsDJAZp+OMNbSZDwSZcX6R7STXespWkh
+# Fz53KOegbYDhuynxWNB8mOLSMXcDZ0kmW8F27P4DIWKp7MDYoqWj5vhqY6EP4N97
+# jF8YL+qpkuNCaGLMHxsU9hcHd2f8VlRz9hMsAkZd3dOwDMAIAY1DmkoIQpmXQaaA
+# o1mni+O9NBhgG5Qli48fkNo/7tNF80zeXe419923ue4s4zKbVq+WQQJs7O2JyFhq
+# Jp+O3MXmW+k07wGi1DnBlH9Sn0GljbihggKiMIICngYJKoZIhvcNAQkGMYICjzCC
+# AosCAQEwaDBSMQswCQYDVQQGEwJCRTEZMBcGA1UEChMQR2xvYmFsU2lnbiBudi1z
+# YTEoMCYGA1UEAxMfR2xvYmFsU2lnbiBUaW1lc3RhbXBpbmcgQ0EgLSBHMgISESHW
+# madklz7x+EJ+6RnMU0EUMAkGBSsOAwIaBQCggf0wGAYJKoZIhvcNAQkDMQsGCSqG
+# SIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMTkwMzA4MTkxOTE3WjAjBgkqhkiG9w0B
+# CQQxFgQUucZlv0T6dYdj5EJSS5a5ogwwQNYwgZ0GCyqGSIb3DQEJEAIMMYGNMIGK
+# MIGHMIGEBBRjuC+rYfWDkJaVBQsAJJxQKTPseTBsMFakVDBSMQswCQYDVQQGEwJC
+# RTEZMBcGA1UEChMQR2xvYmFsU2lnbiBudi1zYTEoMCYGA1UEAxMfR2xvYmFsU2ln
+# biBUaW1lc3RhbXBpbmcgQ0EgLSBHMgISESHWmadklz7x+EJ+6RnMU0EUMA0GCSqG
+# SIb3DQEBAQUABIIBABgY3qaUtpfvF6OZwr8MiHjm1UMa2ca9qxNJ7XL4fHvEzYPY
+# NKTPcso+P4v8ZNNQA8hFC3DMzYj2p5Cji/Zb2syGLQ4bswz9+0BeoPCscI0uW5Wx
+# eK4mjPbZQ00BSpysuaOBDxTGgsKi8MLBxho6RPD/R5Mk5j+1me2fNQzhbvb+1RMF
+# DbHtu46cxBDKGmF1LVb86R9FUfl5fmeI2UaypkcNg1FH3ZYj3r6nx8hzNllWqV5g
+# 1D1J1kTtsQQLlSYOVYwOzqqFOx41HsZYyJWLVcR2Rzj8iTrJR+014Zk8y27ZREr8
+# z5KNIG++aepPeSUrOonSX/t7BCAL2j4ZZRHYIWE=
+# SIG # End signature block
